@@ -1936,7 +1936,6 @@ class _Bf16Autograd(torch.autograd.Function):
         )
         from dist_moe._triton_ops import (
             copy_dispatch_to_activation,
-            copy_routing,
             copy_routing_and_dispatch,
             swiglu_fwd,
         )
@@ -1977,25 +1976,15 @@ class _Bf16Autograd(torch.autograd.Function):
         # 2. Publish routing and activation payloads before deriving peer
         # pointers. Every rank observes both payloads after the same barrier.
         with record_function("dist_moe_preprocess"):
-            if config.inference:
-                copy_routing(
-                    expert_ids=topk_expert_ids_TK,
-                    routing=routing_local_TK,
-                    routing_token_count_1=routing_token_count_1,
-                    num_experts=config.num_experts,
-                    validate_expert_ids=options.validate_expert_ids,
-                )
-                dispatch_local_TD.copy_(x_TD)
-            else:
-                copy_routing_and_dispatch(
-                    x=x_TD,
-                    dispatch=dispatch_local_TD,
-                    expert_ids=topk_expert_ids_TK,
-                    routing=routing_local_TK,
-                    routing_token_count_1=routing_token_count_1,
-                    num_experts=config.num_experts,
-                    validate_expert_ids=options.validate_expert_ids,
-                )
+            copy_routing_and_dispatch(
+                x=x_TD,
+                dispatch=dispatch_local_TD,
+                expert_ids=topk_expert_ids_TK,
+                routing=routing_local_TK,
+                routing_token_count_1=routing_token_count_1,
+                num_experts=config.num_experts,
+                validate_expert_ids=options.validate_expert_ids,
+            )
             _ep_barrier(buffers.dispatch)
 
         with record_function("dist_moe_routing"):
