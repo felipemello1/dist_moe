@@ -2000,9 +2000,10 @@ class _Bf16Autograd(torch.autograd.Function):
                 max_num_recv_tokens=context.memory_plan.total_scratch_capacity_rows,
             )
 
-        num_recv_rows_1 = routing.num_tokens_per_rank[
-            local_rank : local_rank + 1
-        ].clone()
+        num_recv_rows_1 = routing.num_tokens_per_rank[local_rank : local_rank + 1]
+        # Only backward keeps the count past this call.
+        if save_for_backward:
+            num_recv_rows_1 = num_recv_rows_1.clone()
         model_config = _model_config(
             config,
             ep_size=dist.get_world_size(context.group),
