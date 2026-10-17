@@ -157,7 +157,12 @@ def scale_and_sum(
     num_sms = num_sms_per_device()
     # Inference omits the copy and benefits from more reduction CTAs.
     num_ctas = num_sms * (32 if return_copy else 64)
-    grid = (num_ctas, 1, 1)
+    # Mirrors the kernel's tile count: each CTA owns cdiv(num_tiles, NUM_CTA) tiles,
+    # so CTAs past num_tiles have none.
+    num_tiles = triton.cdiv(T, BLOCK_SIZE_T)
+    if T <= SCALE_AND_SUM_TILE_D_MAX_TOKENS:
+        num_tiles *= triton.cdiv(D, BLOCK_SIZE_D)
+    grid = (max(1, min(num_ctas, num_tiles)), 1, 1)
     _triton_scale_and_sum[grid](
         x,
         scale,

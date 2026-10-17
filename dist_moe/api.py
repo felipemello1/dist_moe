@@ -2095,6 +2095,13 @@ class _Bf16Autograd(torch.autograd.Function):
             # Clip observation and unsupported explicit presets retain the
             # standalone activation; eligible dispatch emits both H1 and H2.
             if not fused_swiglu_forward:
+                # A token picks each expert at most once, so every peer sends at
+                # most min(top_k, local experts) routes per token.
+                max_recv_rows = (
+                    dist.get_world_size(context.group)
+                    * num_local_input_tokens
+                    * min(context.top_k, w13_EFD.shape[0])
+                )
                 swiglu_fwd(
                     x=forward_plan.h1_offset,
                     z=forward_plan.h2_offset,
@@ -2107,6 +2114,7 @@ class _Bf16Autograd(torch.autograd.Function):
                     dtype=w2_EDF.dtype,
                     clip_stats_out=options.swiglu_clip_stats_out_3,
                     clip_limit=options.swiglu_clip_limit,
+                    max_rows=max_recv_rows,
                 )
             h3_MD = dist_grouped_gemm_fprop_combine(
                 x=forward_plan.h2_offset,

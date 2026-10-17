@@ -285,6 +285,7 @@ def swiglu_fwd(
     clamped: bool = False,
     alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    max_rows: int | None = None,
 ) -> torch.Tensor:
     """
     Fused silu and mul operations.
@@ -321,6 +322,9 @@ def swiglu_fwd(
             leaving behavior and performance unchanged.
         clip_limit: Threshold used by the clip-count pass (strict `>`). Only
             meaningful when clip_stats_out is provided.
+        max_rows: Optional host upper bound on the device row count in
+            activation_buffer mode. It sizes the launch grid, and rows past it
+            are never computed, so it must not be smaller than the row count.
 
     Returns:
         z: output tensor of shape (T, D), or z (z_offset) when activation_buffer is used.
@@ -402,8 +406,12 @@ def swiglu_fwd(
         T = 0  # Not used in activation_buffer mode, T comes from device tensor
 
         # Single kernel launch for activation_buffer mode
-        grid = (cta_cap, 1, 1)
         BLOCK_T, BLOCK_D, num_warps, d_tiles = _swiglu_fwd_tile(D)
+        # CTAs past the active tiles have none, so a host row bound caps the grid.
+        grid_ctas = cta_cap
+        if max_rows is not None:
+            grid_ctas = max(1, min(cta_cap, triton.cdiv(max_rows, BLOCK_T) * d_tiles))
+        grid = (grid_ctas, 1, 1)
         _triton_swiglu_fwd[grid](
             ptr_x=xy_offset,
             stride_x_t=stride_xy_t,
