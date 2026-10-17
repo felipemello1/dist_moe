@@ -168,6 +168,8 @@ rows per local expert and produce:
 - `num_tokens_per_rank` and the local received-row count.
 
 These tensors live in ordinary local HBM or context-owned routing workspace.
+Inference routing also zeroes the two grouped-GEMM counter tensors, so the
+dispatch and combine launches skip their own memsets.
 The BF16 path does not add per-expert row padding. The operation never
 transfers route counts to the CPU.
 

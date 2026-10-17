@@ -300,6 +300,53 @@ def allocate_decode_counter_storage(
     return torch.empty(rows + num_groups + 2, dtype=torch.int32, device=device)
 
 
+# Smallest token tile of an activation-buffer FPROP launch: every BF16 preset
+# and auto config has BM >= 64, and SWAP_AB is rejected with the buffer.
+_MIN_ACTIVATION_BUFFER_TOKEN_TILE = 64
+
+
+def _activation_buffer_kernel_m(
+    *, buffer_bytes: int, row_elements: int, itemsize: int
+) -> int:
+    """Return the kernel-M bound of an activation-buffer launch.
+
+    The launcher and ``allocate_activation_buffer_counter_storage`` must agree on
+    it. A dispatch row holds the gathered input and the output; a combine row only
+    the input.
+    """
+    return max(1, buffer_bytes // (row_elements * itemsize))
+
+
+def allocate_activation_buffer_counter_storage(
+    *, activation_buffer: torch.Tensor, w: torch.Tensor, is_dispatch: bool
+) -> torch.Tensor:
+    """Allocate the counters of one activation-buffer FPROP launch; routing zeroes them.
+
+    Sized for the smallest token tile, so any config fits:
+        kernel_M 1000, 64-row tiles, 64 experts -> 1 + 1 + (16 + 64) = 82 int32
+
+    Args:
+        activation_buffer: Byte buffer the launch reads and writes.
+        w: Expert weights ``[G, N, K]`` of the launch.
+        is_dispatch: Whether this is the W13 dispatch launch (else W2 combine).
+
+    Returns:
+        Uninitialized int32 counter storage for ``precleared_counter_storage``.
+    """
+    num_groups, out_dim, in_dim = w.shape
+    kernel_m = _activation_buffer_kernel_m(
+        buffer_bytes=activation_buffer.numel(),
+        row_elements=in_dim + out_dim if is_dispatch else in_dim,
+        itemsize=w.element_size(),
+    )
+    splits = _counter_workspace_splits(
+        kernel_m=kernel_m,
+        block_m=_MIN_ACTIVATION_BUFFER_TOKEN_TILE,
+        num_groups=num_groups,
+    )
+    return torch.empty(sum(splits), dtype=torch.int32, device=activation_buffer.device)
+
+
 def _native_mega_counter_storage_splits(
     *,
     rows: int,
@@ -569,8 +616,11 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
             gathered_offset_t = x_gathered
             # Kernel-M upper bound from buffer capacity; split_sizes
             # drives actual writes.
-            buffer_bytes = activation_buffer.numel()
-            max_GM = max(1, buffer_bytes // ((in_dim + out_dim) * ab_itemsize))
+            max_GM = _activation_buffer_kernel_m(
+                buffer_bytes=activation_buffer.numel(),
+                row_elements=in_dim + out_dim,
+                itemsize=ab_itemsize,
+            )
             kernel_M = max_GM
             # Typed views at offset 0; pointer is ignored at runtime
             # (descriptor is patched), shape/strides are honored.
@@ -602,8 +652,11 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
                 "x must be int64[1] offset tensor in activation_buffer mode"
             )
             input_offset_t = x
-            buffer_bytes = activation_buffer.numel()
-            max_M = max(1, buffer_bytes // (in_dim * ab_itemsize))
+            max_M = _activation_buffer_kernel_m(
+                buffer_bytes=activation_buffer.numel(),
+                row_elements=in_dim,
+                itemsize=ab_itemsize,
+            )
             kernel_M = max_M
             a_input = activation_buffer.view(ab_dtype)[: max_M * in_dim].view(
                 max_M, in_dim
@@ -1195,6 +1248,10 @@ def dist_grouped_gemm_fprop_dispatch(
     never silently substitutes another variant. Weight and expert-output
     processing remain outside this boundary.
 
+    `precleared_counter_storage`, when given, holds int32 counters the caller
+    zeroed before this launch (`allocate_activation_buffer_counter_storage`);
+    the launch then skips its own memset.
+
     Returns: (y_out, x_out), or the original (y_offset, x_gathered_offset)
     tensors when activation_buffer is provided.
     """
@@ -1520,6 +1577,8 @@ def dist_grouped_gemm_fprop_combine(
     When `activation_buffer` is provided, `x` is an int64[1] byte-offset
     tensor; kernel patches its A-tensor TMA descriptor at runtime.
     Addresses must be 128-byte aligned.
+
+    `precleared_counter_storage` follows the dispatch launch's contract.
 
     The caller owns all peer synchronization.
     """

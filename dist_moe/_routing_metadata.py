@@ -360,7 +360,8 @@ def _decode_dispatch_routing(
     scatter_stride_bytes: int,
     m_multiple_of: int,
     max_num_recv_tokens: int | None,
-    pointer_capacity_multiple_of: int = 1,
+    pointer_capacity_multiple_of: int,
+    counter_workspaces: tuple[torch.Tensor, ...],
 ) -> DistDispatchRoutingOutput:
     """Allocate, clear, and execute one direct decode routing launch.
 
@@ -379,6 +380,7 @@ def _decode_dispatch_routing(
         m_multiple_of: Per-expert row padding multiple.
         max_num_recv_tokens: Optional configured receive-row ceiling.
         pointer_capacity_multiple_of: Physical pointer-storage row alignment.
+        counter_workspaces: Grouped-GEMM counter tensors to zero in the clear launch.
 
     Returns:
         Routing counts and gather/scatter pointer tables.
@@ -399,7 +401,7 @@ def _decode_dispatch_routing(
         max_num_recv_tokens=max_num_recv_tokens,
         pointer_capacity_multiple_of=pointer_capacity_multiple_of,
     )
-    _clear_prepared_decode_routing(prepared)
+    _clear_prepared_decode_routing(prepared, counter_workspaces=counter_workspaces)
     return launch_prepared_decode_routing(prepared)
 
 
@@ -730,6 +732,7 @@ def dist_dispatch_routing(
     generate_bwd_gather_ptrs: bool = True,
     use_low_latency: bool = False,
     pointer_capacity_multiple_of: int = 1,
+    counter_workspaces: tuple[torch.Tensor, ...] = (),
 ) -> DistDispatchRoutingOutput:
     """Compute routing indices for distributed grouped GEMM with expert parallelism.
 
@@ -799,6 +802,8 @@ def dist_dispatch_routing(
         pointer_capacity_multiple_of: Physical pointer-storage row alignment
               for a capacity-shaped consumer. The configured receive-row
               overflow guard is unchanged.
+        counter_workspaces: Up to two int32 grouped-GEMM counter tensors this
+              call zeroes, so the GEMM launches need no memset of their own.
 
     Returns:
         DistDispatchRoutingOutput containing:
@@ -881,7 +886,12 @@ def dist_dispatch_routing(
             m_multiple_of=m_multiple_of_constexpr,
             max_num_recv_tokens=max_num_recv_tokens,
             pointer_capacity_multiple_of=pointer_capacity_multiple_of,
+            counter_workspaces=counter_workspaces,
         )
+    # The general path does not clear them in a launch of its own; zero them here
+    # so the GEMM launches can still skip their memsets.
+    for workspace in counter_workspaces:
+        workspace.zero_()
 
     # Plan the split grid before the gather launch so the gather CTAs can also
     # initialize the counters consumed by the split kernel.

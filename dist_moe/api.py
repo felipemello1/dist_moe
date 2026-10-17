@@ -1941,6 +1941,7 @@ class _Bf16Autograd(torch.autograd.Function):
         )
         from dist_moe.kernels.dist_grouped_gemm import (
             _native_swiglu_fwd_config_is_compatible,
+            allocate_activation_buffer_counter_storage,
             dist_grouped_gemm_fprop_combine,
             dist_grouped_gemm_fprop_dispatch,
         )
@@ -1987,6 +1988,19 @@ class _Bf16Autograd(torch.autograd.Function):
             )
             _ep_barrier(buffers.dispatch)
 
+        # Inference routing zeroes the grouped-GEMM counters, so the GEMM
+        # launches skip their own memsets.
+        dispatch_counter_storage = combine_counter_storage = None
+        counter_workspaces = ()
+        if config.inference:
+            dispatch_counter_storage = allocate_activation_buffer_counter_storage(
+                activation_buffer=activation_buffer.buffer, w=w13_EFD, is_dispatch=True
+            )
+            combine_counter_storage = allocate_activation_buffer_counter_storage(
+                activation_buffer=activation_buffer.buffer, w=w2_EDF, is_dispatch=False
+            )
+            counter_workspaces = (dispatch_counter_storage, combine_counter_storage)
+
         with record_function("dist_moe_routing"):
             assert context.memory_plan is not None
             routing = dist_dispatch_routing(
@@ -1998,6 +2012,7 @@ class _Bf16Autograd(torch.autograd.Function):
                 generate_bwd_gather_ptrs=not scratch_only,
                 use_low_latency=config.inference,
                 max_num_recv_tokens=context.memory_plan.total_scratch_capacity_rows,
+                counter_workspaces=counter_workspaces,
             )
 
         num_recv_rows_1 = routing.num_tokens_per_rank[local_rank : local_rank + 1]
@@ -2081,6 +2096,7 @@ class _Bf16Autograd(torch.autograd.Function):
                 swiglu_clamped=config.activation == "swiglu_clamped",
                 swiglu_alpha=config.swiglu_alpha,
                 swiglu_limit=config.swiglu_limit,
+                precleared_counter_storage=dispatch_counter_storage,
             )
             # Clip observation and unsupported explicit presets retain the
             # standalone activation; eligible dispatch emits both H1 and H2.
@@ -2116,6 +2132,7 @@ class _Bf16Autograd(torch.autograd.Function):
                 activation_buffer=activation_buffer.buffer,
                 config=combine_config,
                 estimate_recv_num_tokens=estimated_num_recv_rows,
+                precleared_counter_storage=combine_counter_storage,
             )
             h3_MD = h3_MD.view(-1, context.hidden_dim)[
                 : num_local_input_tokens * context.top_k
