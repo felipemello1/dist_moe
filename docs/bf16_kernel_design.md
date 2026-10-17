@@ -12,6 +12,7 @@ saved-state, or backward-lifetime model.
 
 - [Scope](#scope)
 - [Persistent grouped GEMM](#persistent-grouped-gemm)
+- [Block-major weights](#block-major-weights)
 - [CTA roles](#cta-roles)
 - [SwiGLU](#swiglu)
 - [Launch policy](#launch-policy)
@@ -53,6 +54,24 @@ Host-side configuration chooses one- or two-CTA clusters, tile M/N/K, pipeline
 depth, epilogue subdivision, and static or dynamic scheduling. These choices
 are compile-time CuTe parameters and form a performance-sensitive
 specialization contract.
+
+<a id="block-major-weights"></a>
+## Block-major weights
+
+A B tile of a row-major `[N, K]` weight is `BLOCK_SIZE_N` strided 128-byte rows.
+With `Config.block_major_weights`, every W13 and W2 was rewritten by
+`relayout_to_block_major`, so each expert stores `[K / 64, N, 64]` and a 64-wide
+K tile of all its rows is contiguous:
+
+```text
+row-major:    r0[0:64] r0[64:128] r1[0:64] r1[64:128] ...
+block-major:  r0[0:64] r1[0:64] ... r(N-1)[0:64] r0[64:128] r1[64:128] ...
+```
+
+The FPROP dispatch and combine kernels view B as `(N, (64, K/64), G) :
+(64, (1, 64N), NK)`; the TMA atom and partitions are unchanged. Only BF16
+inference supports it: DGRAD and WGRAD read the weights row-major, and the
+fused SwiGLU dispatch epilogue is not used with it.
 
 <a id="cta-roles"></a>
 ## CTA roles

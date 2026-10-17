@@ -651,6 +651,20 @@ config = dataclasses.replace(
 
 See the precision-specific execution guides for the exact formula.
 
+### Block-major BF16 inference weights
+
+BF16 inference streams W13/W2 faster when each expert's `[N, K]` weight is
+stored as `[K / 64, N, 64]`. Rewrite caller-owned weights once per load, then
+use a context with `block_major_weights=True`:
+
+```python
+dist_moe.relayout_to_block_major(w13_EFD)
+dist_moe.relayout_to_block_major(w2_EDF)
+config = dataclasses.replace(config, block_major_weights=True)
+```
+
+See [the BF16 kernel design](docs/bf16_kernel_design.md#block-major-weights).
+
 ### Clip statistics
 
 BF16 execution can rewrite caller-owned SwiGLU counters on every forward. The
@@ -720,6 +734,7 @@ device capacity may use host backing. See [VMM host-backed scratch](docs/vmm.md)
 | [`dist_moe.MemoryPlan`](docs/memory_planner.md) / [`dist_moe.plan_memory`](docs/memory_planner.md) | Immutable memory plan and pure planning function |
 | [`dist_moe.Context`](docs/bf16_execution.md) / [`dist_moe.create_context`](docs/bf16_execution.md) | Reusable distributed runtime state and collective factory |
 | [`dist_moe.PreparedWeight`](docs/mxfp8_execution.md) / [`dist_moe.prepare_block_scaled_weight`](docs/mxfp8_execution.md) | Caller-owned block-scaled weight storage and preparation |
+| [`dist_moe.relayout_to_block_major`](docs/bf16_kernel_design.md#block-major-weights) | In-place block-major rewrite of BF16 inference weights |
 | [`dist_moe.routed_experts`](docs/bf16_execution.md) | BF16/MXFP8 training or BF16/MXFP8/NVFP4 inference |
 | [`dist_moe.supports_fused_post_expert_rmsnorm`](docs/postprocess.md) | Query fused RMSNorm shape/dtype support |
 

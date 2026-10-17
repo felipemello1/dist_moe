@@ -827,6 +827,33 @@ class DistMoeConfigTest(unittest.TestCase):
                         **{field: value},
                     )
 
+    def test_block_major_weights_require_bf16_inference(self) -> None:
+        """Block-major weights are an opt-in for BF16 inference with 64-aligned F.
+
+        Config-only; the GPU test below covers execution.
+        """
+        base = dict(
+            max_num_local_input_tokens=4,
+            hidden_dim=128,
+            intermediate_dim=128,
+            top_k=2,
+            num_experts=4,
+            max_moe_layers_per_activation_slot=1,
+            block_major_weights=True,
+        )
+        dist_moe.Config(**base, inference=True, num_activation_slots=0)
+        inference = {"inference": True, "num_activation_slots": 0}
+        for overrides in (
+            {},
+            {**inference, "intermediate_dim": 96},
+            {**inference, "block_scaled": dist_moe.BlockScaledConfig()},
+        ):
+            with (
+                self.subTest(overrides=overrides),
+                self.assertRaisesRegex(ValueError, "block_major_weights"),
+            ):
+                dist_moe.Config(**{**base, **overrides})
+
     def test_mxfp8_weight_preparation_supports_fake_tensor_tracing(self) -> None:
         """Fake preparation preserves exact packed shapes and backward ownership.
 
@@ -4406,6 +4433,68 @@ class DistMoeKernelTest(unittest.TestCase):
                 rtol=3e-2,
                 atol=3e-2,
             )
+
+    def test_bf16_inference_block_major_weights_match_row_major(self) -> None:
+        """Block-major weights give the row-major inference output exactly.
+
+        The same routed tokens run once with row-major W13/W2 and once with the
+        weights rewritten by ``relayout_to_block_major`` on a context with
+        ``block_major_weights``; outputs must be bitwise equal. Cases: the auto
+        config at D = F = 256 and at D = 320, F = 192 (a W2 N tail and three K
+        blocks), a 128-row preset that would otherwise fuse SwiGLU into the
+        dispatch epilogue, and a two-CTA preset.
+        """
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case()
+        x_TD, ids_TK, _ = case_a
+        torch.manual_seed(7)
+        cases = [
+            (case_a, w13_EFD, w2_EDF, context.config),
+            *(
+                (
+                    case_a,
+                    w13_EFD,
+                    w2_EDF,
+                    dataclasses.replace(context.config, bf16_grouped_gemm_preset=p),
+                )
+                for p in ("1cta1mma_bm128_bn128", "2cta2mma_bm512_bn256")
+            ),
+            (
+                (
+                    torch.randn(len(x_TD), 320, device="cuda").bfloat16(),
+                    ids_TK,
+                    case_a[2],
+                ),
+                torch.randn(4, 384, 320, device="cuda", dtype=torch.bfloat16) * 0.05,
+                torch.randn(4, 320, 192, device="cuda", dtype=torch.bfloat16) * 0.07,
+                dataclasses.replace(
+                    context.config, hidden_dim=320, intermediate_dim=192
+                ),
+            ),
+        ]
+        for (x, ids, scores), w13, w2, config in cases:
+            with self.subTest(
+                preset=config.bf16_grouped_gemm_preset, hidden_dim=config.hidden_dim
+            ):
+                row_context = dist_moe.create_context(
+                    group=dist.group.WORLD, config=config
+                )
+                block_context = dist_moe.create_context(
+                    group=dist.group.WORLD,
+                    config=dataclasses.replace(config, block_major_weights=True),
+                )
+                block_w13, block_w2 = w13.clone(), w2.clone()
+                dist_moe.relayout_to_block_major(block_w13)
+                dist_moe.relayout_to_block_major(block_w2)
+                with torch.inference_mode():
+                    row_major_TD = dist_moe.routed_experts(
+                        x, ids, scores, w13, w2, row_context
+                    )
+                    block_major_TD = dist_moe.routed_experts(
+                        x, ids, scores, block_w13, block_w2, block_context
+                    )
+                row_context.close()
+                block_context.close()
+                torch.testing.assert_close(block_major_TD, row_major_TD, rtol=0, atol=0)
 
     def test_two_saved_layers_match_reference_without_recompute(self) -> None:
         """Each layer retains its own post-combine state for score gradients."""

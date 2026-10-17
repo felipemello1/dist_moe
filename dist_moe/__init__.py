@@ -19,6 +19,7 @@ from .api import (
     plan_memory,
     prepare_block_scaled_weight,
     PreparedWeight,
+    relayout_to_block_major,
     RMSNormPostprocess,
     routed_experts,
     supports_fused_post_expert_rmsnorm,
@@ -40,6 +41,7 @@ __all__ = [
     "create_context",
     "plan_memory",
     "prepare_block_scaled_weight",
+    "relayout_to_block_major",
     "routed_experts",
     "supports_fused_post_expert_rmsnorm",
 ]
