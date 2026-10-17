@@ -5062,6 +5062,103 @@ class DistMoeTwoRankTest(unittest.TestCase):
                 )
 
     @with_comms
+    def test_bf16_inference_single_a_tensormap_matches_per_group(self) -> None:
+        """One A descriptor per CTA gives the per-group descriptors' exact output.
+
+        Two ranks, BF16 inference, the auto (one-CTA) config. Routing is uneven:
+        expert 0 gets more than one 64-row tile, most experts get no rows, rank 1
+        sends nothing in one case, and NaN tokens sit next to valid ones, so tile
+        tails load other experts' rows, including NaN rows. Valid outputs must be
+        bitwise equal to the same call with per-group descriptors, and both GEMMs
+        must have used the single descriptor. No other test runs BF16 inference
+        over real peers.
+        """
+        import dist_moe.kernels.dist_grouped_gemm as gemm_impl
+
+        rank = dist.get_rank()
+        device = torch.device("cuda", rank)
+        num_experts, top_k, hidden_dim, intermediate_dim = 16, 4, 256, 256
+        config = dist_moe.Config(
+            max_num_local_input_tokens=128,
+            num_experts=num_experts,
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            top_k=top_k,
+            max_moe_layers_per_activation_slot=1,
+            device_scratch_capacity_factor=float(self.world_size),
+            inference=True,
+        )
+        context = dist_moe.create_context(group=dist.group.WORLD, config=config)
+        generator = torch.Generator(device=device).manual_seed(11)
+        num_local_experts = num_experts // self.world_size
+        w13 = (
+            torch.randn(
+                num_local_experts,
+                2 * intermediate_dim,
+                hidden_dim,
+                device=device,
+                generator=generator,
+            )
+            .mul_(hidden_dim**-0.5)
+            .bfloat16()
+        )
+        w2 = (
+            torch.randn(
+                num_local_experts,
+                hidden_dim,
+                intermediate_dim,
+                device=device,
+                generator=generator,
+            )
+            .mul_(intermediate_dim**-0.5)
+            .bfloat16()
+        )
+        get_kernel = gemm_impl._get_dist_kernel
+        single_flags = []
+
+        def record_kernel(*args, **kwargs):
+            single_flags.append((kwargs["mode"], kwargs["single_a_tensormap"]))
+            return get_kernel(*args, **kwargs)
+
+        launch = gemm_impl._fused_dist_grouped_gemm_impl
+
+        def per_group_launch(*args, **kwargs):
+            return launch(*args, **{**kwargs, "single_a_tensormap": False})
+
+        # (tokens per rank, experts every token picks, rank-1 sends nothing)
+        for num_tokens, picks, rank1_empty in (
+            (90, (0, 3, 9, 14), False),
+            (1, (0, 7, 8, 15), False),
+            (33, (0, 1, 2, 3), True),
+        ):
+            x = torch.randn(
+                num_tokens, hidden_dim, device=device, generator=generator
+            ).bfloat16()
+            x[1::5] = float("nan")
+            ids = torch.tensor(picks, device=device).expand(num_tokens, -1).clone()
+            scores = torch.rand(
+                num_tokens, top_k, device=device, generator=generator
+            ).softmax(dim=-1)
+            if rank1_empty and rank == 1:
+                ids.fill_(-1)
+                scores.zero_()
+            single_flags.clear()
+            with torch.inference_mode():
+                with mock.patch.object(gemm_impl, "_get_dist_kernel", record_kernel):
+                    single = dist_moe.routed_experts(x, ids, scores, w13, w2, context)
+                with mock.patch.object(
+                    gemm_impl, "_fused_dist_grouped_gemm_impl", per_group_launch
+                ):
+                    per_group = dist_moe.routed_experts(
+                        x, ids, scores, w13, w2, context
+                    )
+            self.assertTrue(single_flags and all(flag for _, flag in single_flags))
+            valid = torch.isfinite(x).all(dim=1)
+            self.assertTrue(torch.isfinite(single[valid]).all())
+            torch.testing.assert_close(single[valid], per_group[valid], rtol=0, atol=0)
+        context.close()
+
+    @with_comms
     def test_fully_padded_rank_exercises_peer_paths(self) -> None:
         """A rank with only `-1` routes contributes no BF16/MXFP8 work."""
         for block_scaled in (None, dist_moe.BlockScaledConfig()):

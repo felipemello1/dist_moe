@@ -489,6 +489,13 @@ class GroupedGemmKernel:
     # Rotate each M tile's N-band order (`_tile_coords` DIAG_N_BANDS). Every
     # warp role must decode tiles with the same value.
     DIAG_N_BANDS: bool = False
+    # FPROP only (set by DistGroupedGemmKernel): read every group's A rows
+    # through one descriptor at a row offset instead of patching, and draining
+    # before, a descriptor per group. A tile's tail then loads the next group's
+    # rows (possibly still being gathered). Safe: an output row depends only on
+    # its own A row and every epilogue clips to m_size (per-group C descriptor,
+    # fused SwiGLU stores, combine scatter `row_in_group < m_size`).
+    SINGLE_A_TENSORMAP: bool = False
 
     def __init__(
         self,
@@ -1360,6 +1367,7 @@ class GroupedGemmKernel:
         BLOCK_SIZE_K: cutlass.Constexpr[int],
         NUM_CTAS: cutlass.Constexpr[int],
         secondary_operands=None,
+        a_coord_layout=None,
     ):
         """TMA producer task. Ports the TLX producer body in control flow,
         with intentional 2-CTA cooperative-tile semantics (see deltas below).
@@ -1367,8 +1375,9 @@ class GroupedGemmKernel:
         Mirrors TLX:
             * Persistent atomic-counter scheduler (CTA 0 fetches; CTA 1
               receives via DSMEM).
-            * Per-group: tensormap update once at group entry, then
-              tile-by-tile k-loop until tile_idx leaves the group's range.
+            * Per-group: tensormap update once at group entry (or once per
+              CTA with `SINGLE_A_TENSORMAP`), then tile-by-tile k-loop until
+              tile_idx leaves the group's range.
             * Flow control: `producer_wait_tile_released` placed AFTER TMA
               issue (not before) to avoid a circular deadlock.
             * SENTINEL drain at end so MMA/epilogue consumers terminate.
@@ -1471,6 +1480,42 @@ class GroupedGemmKernel:
         )
         work = visitor.get_work(tile_idx)
 
+        # Per-group A descriptor patch (and the drain before it) unless one
+        # descriptor covers every group.
+        patch_a_per_group = not (self.host_a_tensormap or self.SINGLE_A_TENSORMAP)
+        if cutlass.const_expr(self.SINGLE_A_TENSORMAP):
+            # One A descriptor over every group's rows, from the activation
+            # offset (host_a_tensormap needs padded rows and no activation
+            # buffer). Its extent is the exact row total, so TMA zero-fills past
+            # the last group and never reads past the buffer; at least 1 row so
+            # an empty rank never encodes a zero-size descriptor. The warp sums
+            # the group sizes lane-parallel, loads issued back to back.
+            total_rows = cutlass.Int32(0)
+            lane = cute.arch.lane_idx()
+            for chunk in cutlass.range_constexpr((G + 31) // 32):
+                if lane + chunk * 32 < G:
+                    total_rows += cutlass.Int32(split_sizes[lane + chunk * 32])
+            for shift in cutlass.range_constexpr(5):
+                total_rows += cute.arch.shuffle_sync_bfly(total_rows, offset=1 << shift)
+            tensormap_manager.update_tensormap(
+                (
+                    _make_tensor_for_tensormap_update(
+                        a_base_eff,
+                        self.a_dtype,
+                        (cutlass.max(total_rows, cutlass.Int32(1)), N, K),
+                        a_s0,
+                        a_s1,
+                        tensor_index=0,
+                        problem_type=problem_type,
+                    ),
+                ),
+                (tma_atom_a,),
+                (tensormap_a_ptr,),
+                TMA_WARP_ID,
+                (tensormap_a_smem_ptr,),
+            )
+            tensormap_manager.fence_tensormap_update(tensormap_a_ptr)
+
         while work.is_valid_tile:
             g = work.group_idx
             m_size = work.m_size
@@ -1478,6 +1523,14 @@ class GroupedGemmKernel:
             k_size = work.k_size
             num_k_tiles = work.num_k_tiles
             prev_accum_cnt_smem = accum_cnt_smem
+            group_tAgA = tAgA
+            if cutlass.const_expr(self.SINGLE_A_TENSORMAP):
+                # Shift the A coordinates to this group's first row. domain_offset
+                # needs the (M, K, L) coordinate profile, which the partitioned
+                # tAgA.layout has lost (same idiom as gemm_warp_roles.py).
+                a_coords = cute.make_tensor(tAgA.iterator, a_coord_layout)
+                group_a_coords = cute.domain_offset((work.split_prefix, 0, 0), a_coords)
+                group_tAgA = cute.make_tensor(group_a_coords.iterator, tAgA.layout)
 
             if work.is_valid_tile:
                 # ---- Per-group tensormap update --------------------------
@@ -1547,7 +1600,7 @@ class GroupedGemmKernel:
                             activation_buffer_size_bytes=activation_buffer_size_bytes,
                             warp_scoped_diagnostic=True,
                         )
-                if cutlass.const_expr(not self.host_a_tensormap):
+                if cutlass.const_expr(patch_a_per_group):
                     a_base_g = a_base_eff + a_off_bytes
                     real_tensor_a = _make_tensor_for_tensormap_update(
                         a_base_g,
@@ -1558,9 +1611,7 @@ class GroupedGemmKernel:
                         tensor_index=0,
                         problem_type=problem_type,
                     )
-                if cutlass.const_expr(
-                    not self.host_a_tensormap and self.host_b_tensormap
-                ):
+                if cutlass.const_expr(patch_a_per_group and self.host_b_tensormap):
                     tensormap_manager.update_tensormap(
                         (real_tensor_a,),
                         (tma_atom_a,),
@@ -1600,7 +1651,7 @@ class GroupedGemmKernel:
                 # TMA proxy before any TMA load below uses it. ONCE per group
                 # (the descriptor doesn't change between tiles within a group),
                 # not per tile — the per-tile placement was wasteful.
-                if cutlass.const_expr(not self.host_a_tensormap):
+                if cutlass.const_expr(patch_a_per_group):
                     tensormap_manager.fence_tensormap_update(tensormap_a_ptr)
                 if cutlass.const_expr(not self.host_b_tensormap):
                     tensormap_manager.fence_tensormap_update(tensormap_b_ptr)
@@ -1738,7 +1789,7 @@ class GroupedGemmKernel:
                             )
                             cute.copy(
                                 tma_atom_a,
-                                tAgA[(None, tile_m_idx, kk, 0)],
+                                group_tAgA[(None, tile_m_idx, kk, 0)],
                                 tAsA[(None, buf)],
                                 tma_bar_ptr=ab_full_mbar + buf,
                                 mcast_mask=a_full_mcast_mask,
@@ -1790,7 +1841,7 @@ class GroupedGemmKernel:
                             )
                             cute.copy(
                                 tma_atom_a,
-                                tAgA[(None, tile_m_idx, kk, 0)],
+                                group_tAgA[(None, tile_m_idx, kk, 0)],
                                 tAsA[(None, buf)],
                                 tma_bar_ptr=ab_full_mbar + buf,
                                 mcast_mask=a_full_mcast_mask,
@@ -1836,12 +1887,15 @@ class GroupedGemmKernel:
             # 2-CTA: leader is the one who armed the bar via
             # mbarrier_arrive_and_expect_tx, so only leader waits. Peer CTA
             # has no equivalent local arrive on this bar.
-            if accum_cnt_smem > prev_accum_cnt_smem:
-                if (NUM_CTAS == 1) or (cluster_cta_rank == 0):
-                    buf, phase = _get_bufidx_phase(
-                        accum_cnt_smem - cutlass.Int32(1), NUM_SMEM_BUFFERS
-                    )
-                    cute.arch.mbarrier_wait(ab_full_mbar + buf, phase)
+            # Skipped for a single A descriptor: nothing is patched between
+            # groups (B uses the host descriptor).
+            if cutlass.const_expr(not self.SINGLE_A_TENSORMAP):
+                if accum_cnt_smem > prev_accum_cnt_smem:
+                    if (NUM_CTAS == 1) or (cluster_cta_rank == 0):
+                        buf, phase = _get_bufidx_phase(
+                            accum_cnt_smem - cutlass.Int32(1), NUM_SMEM_BUFFERS
+                        )
+                        cute.arch.mbarrier_wait(ab_full_mbar + buf, phase)
 
         scheduler.producer_publish_termination(accum_cnt_out)
 
