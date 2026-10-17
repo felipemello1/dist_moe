@@ -264,13 +264,15 @@ def _triton_decode_dispatch_routing(
         & (local_expert_indices >= 0)
         & (local_expert_indices < num_local_experts)
     )
-    expert_prefixes = tl.sum(
-        tl.where(
-            local_expert_ids[None, :] < local_expert_indices[:, None],
-            padded_local_expert_counts[None, :],
-            0,
-        ),
-        axis=1,
+    # Each local expert's first row (exclusive prefix), then one lookup per slot.
+    # Non-local slots look up entry 0; the stores below mask them out.
+    local_expert_starts = (
+        tl.cumsum(padded_local_expert_counts, axis=0) - padded_local_expert_counts
+    )
+    expert_prefixes = tl.gather(
+        local_expert_starts,
+        tl.where(routes_to_local_expert, local_expert_indices, 0),
+        axis=0,
     )
     output_rows = expert_prefixes.to(tl.int64) + expert_slots.to(tl.int64)
 
