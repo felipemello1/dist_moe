@@ -5130,6 +5130,92 @@ class DistMoeTwoRankTest(unittest.TestCase):
         self.assertEqual(len(preprocess_calls), 4)
 
     @with_comms
+    def test_bf16_decode_routing_matches_general_routing(self) -> None:
+        """Chunked decode routing gives the general routing path's exact output.
+
+        BF16 inference on 384 experts (192 per rank, not a power of two) at 8,
+        2048 and 8192 route slots per rank, i.e. one, two and eight decode
+        routing CTAs per source rank. Each output must be bitwise equal to the
+        same call with decode routing disabled, and the decode path must have
+        run; no other test reaches these expert counts or more than 1024 slots.
+        """
+        import dist_moe._routing_metadata as routing_impl
+
+        rank = dist.get_rank()
+        device = torch.device("cuda", rank)
+        num_experts, top_k, hidden_dim, intermediate_dim = 384, 8, 256, 256
+        num_local_experts = num_experts // self.world_size
+        config = dist_moe.Config(
+            max_num_local_input_tokens=1024,
+            num_experts=num_experts,
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            top_k=top_k,
+            max_moe_layers_per_activation_slot=1,
+            device_scratch_capacity_factor=float(self.world_size),
+            inference=True,
+        )
+        context = dist_moe.create_context(group=dist.group.WORLD, config=config)
+        generator = torch.Generator(device=device).manual_seed(7)
+        w13 = (
+            torch.randn(
+                num_local_experts,
+                2 * intermediate_dim,
+                hidden_dim,
+                device=device,
+                generator=generator,
+            )
+            .mul_(hidden_dim**-0.5)
+            .bfloat16()
+        )
+        w2 = (
+            torch.randn(
+                num_local_experts,
+                hidden_dim,
+                intermediate_dim,
+                device=device,
+                generator=generator,
+            )
+            .mul_(intermediate_dim**-0.5)
+            .bfloat16()
+        )
+        decode_routing = mock.Mock(wraps=routing_impl._decode_dispatch_routing)
+        try:
+            for num_tokens in (1, 256, 1024):
+                generator.manual_seed(100 * num_tokens + rank)
+                x = torch.randn(
+                    num_tokens, hidden_dim, device=device, generator=generator
+                ).bfloat16()
+                ids = (
+                    torch.rand(
+                        num_tokens, num_experts, device=device, generator=generator
+                    )
+                    .topk(top_k, dim=1)
+                    .indices
+                )
+                scores = torch.rand(
+                    num_tokens, top_k, device=device, generator=generator
+                ).softmax(dim=-1)
+                with torch.inference_mode():
+                    decode_routing.reset_mock()
+                    with mock.patch.object(
+                        routing_impl, "_decode_dispatch_routing", decode_routing
+                    ):
+                        decoded = dist_moe.routed_experts(
+                            x, ids, scores, w13, w2, context
+                        )
+                    self.assertEqual(decode_routing.call_count, 1)
+                    with mock.patch.object(
+                        routing_impl, "_can_use_decode_routing", return_value=False
+                    ):
+                        general = dist_moe.routed_experts(
+                            x, ids, scores, w13, w2, context
+                        )
+                torch.testing.assert_close(decoded, general, rtol=0, atol=0)
+        finally:
+            context.close()
+
+    @with_comms
     def test_nvfp4_inference_exercises_peer_paths(self) -> None:
         """Bound prepared NVFP4 inference against the routed reference.
 
