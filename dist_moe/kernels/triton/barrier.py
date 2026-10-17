@@ -16,6 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ..pdl import pdl_launch_kwargs, pdl_wait_then_release
 from .annotations import annotate_barrier
 from .comm_utils import (
     get_flat_tid,
@@ -130,6 +131,7 @@ def _triton_symm_mem_barrier_multimem(
     channel,
     conditional_execution_ptr,
     world_size: tl.constexpr,
+    PDL: tl.constexpr,
 ):
     """Multicast (NVLS) symmetric-memory barrier.
 
@@ -165,6 +167,7 @@ def _triton_symm_mem_barrier_multimem(
     Concurrent barriers on the same channel from different streams are not
     allowed (two interleaved rounds satisfy each other's counts).
     """
+    pdl_wait_then_release(PDL)
     if conditional_execution_ptr is not None:
         cond_val = tl.load(conditional_execution_ptr, eviction_policy="evict_last")
         if cond_val == 0:
@@ -210,4 +213,5 @@ def triton_symm_mem_barrier_multimem_ptrs(
             conditional_execution_ptr=conditional_execution,
             world_size=n_ranks,
             num_warps=1,
+            **pdl_launch_kwargs(),
         )

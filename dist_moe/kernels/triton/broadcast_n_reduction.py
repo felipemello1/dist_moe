@@ -15,6 +15,7 @@ from .._environment import num_sms_per_device
 from ..activation_buffer import (
     validate_conditional_execution,
 )
+from ..pdl import pdl_launch_kwargs, pdl_wait_then_release
 from .repr_utils import make_dtype_repr
 
 SCALE_AND_SUM_TILE_D_MAX_TOKENS = 128
@@ -184,6 +185,7 @@ def scale_and_sum(
         X_DTYPE=_to_tl_dtype(x_dtype),
         BLOCK_K=triton.next_power_of_2(K),
         TILE_D=T <= SCALE_AND_SUM_TILE_D_MAX_TOKENS,
+        **pdl_launch_kwargs(),
     )
     return y, x_copy
 
@@ -213,7 +215,9 @@ def _triton_scale_and_sum(  # noqa: C901
     X_DTYPE: tl.constexpr,
     BLOCK_K: tl.constexpr,
     TILE_D: tl.constexpr,
+    PDL: tl.constexpr = False,
 ) -> None:
+    pdl_wait_then_release(PDL)
     pid = tl.program_id(axis=0).to(tl.int64)
 
     if COPY_X_TO_BUFFER:

@@ -16,6 +16,7 @@ entry points, buffer bookkeeping, and validation live in
 import triton
 import triton.language as tl
 
+from ..pdl import pdl_wait_then_release
 from .comm_utils import (
     get_flat_tid,
     sync_threads,
@@ -81,7 +82,9 @@ def _triton_clear_decode_routing_state(
     counter_workspace_1_size,
     COPY_EXPERT_IDS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    PDL: tl.constexpr,
 ):
+    pdl_wait_then_release(PDL)
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     if COPY_EXPERT_IDS:
         token_offsets = offsets // topk
@@ -172,7 +175,9 @@ def _triton_decode_dispatch_routing(
     BLOCK_LOCAL_EXPERTS: tl.constexpr,
     BLOCK_WORLD_SIZE: tl.constexpr,
     NUM_CHUNKS: tl.constexpr,
+    PDL: tl.constexpr,
 ):
+    pdl_wait_then_release(PDL)
     # One CTA per (source rank, chunk of BLOCK_SLOTS route slots).
     pid = tl.program_id(0)
     source_rank = pid // NUM_CHUNKS

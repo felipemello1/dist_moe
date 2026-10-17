@@ -216,6 +216,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         swiglu_emit_h2: bool = False,
         swiglu_emit_h1: bool = False,
         gather_k_segments: int = _GATHER_K_SEGMENTS,
+        use_pdl: bool = False,
     ) -> None:
         if problem_type not in (_FPROP, _DGRAD, _WGRAD):
             raise ValueError(
@@ -265,6 +266,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         self.swiglu_emit_h2 = swiglu_emit_h2
         self.swiglu_emit_h1 = swiglu_emit_h1
         self.has_padding_sentinels = has_padding_sentinels
+        self.use_pdl = use_pdl
         self.output_accum = output_accum
         # 2CTA needs finer gather granularity because CuTe splits one M
         # tile across CTAs.
@@ -935,6 +937,12 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                 barrier_id=_BAR_FULL_CTA_SYNC,
                 number_of_threads=DIST_THREADS_PER_CTA_DISPATCH,
             )
+
+        # PDL: the barrier setup above touches no global memory, so it overlaps
+        # the previous kernel. Wait before the first global read (the flag below).
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
 
         # Conditional execution: gate body calls on a device flag.
         # CuTeDSL forbids early returns from `@cute.kernel`, so we
@@ -1625,6 +1633,11 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                 number_of_threads=cta_threads,
             )
 
+        # PDL: wait before the first global read, as in the dispatch kernel.
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+            cute.arch.griddepcontrol_launch_dependents()
+
         # Conditional execution: gate body calls on a device flag.
         # CuTeDSL forbids early returns from `@cute.kernel`; TMEM
         # alloc + dealloc still run so resources release cleanly.
@@ -2299,6 +2312,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                 block=(DIST_THREADS_PER_CTA_DISPATCH, 1, 1),
                 cluster=(*self.cluster_shape_mn, 1),
                 stream=stream,
+                use_pdl=self.use_pdl,
             )
         else:  # COMBINE
             self.combine_kernel(
@@ -2370,4 +2384,5 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                 ),
                 cluster=(*self.cluster_shape_mn, 1),
                 stream=stream,
+                use_pdl=self.use_pdl,
             )

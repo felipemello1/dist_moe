@@ -51,6 +51,7 @@ from .._environment import num_sms_per_device
 from ..activation_buffer import (
     validate_conditional_execution,
 )
+from ..pdl import pdl_launch_kwargs, pdl_wait_then_release
 from .comm_utils import get_flat_tid
 from .device_trap import device_trap_if
 
@@ -209,6 +210,7 @@ def copy_routing_and_dispatch(
         num_stages=_COPY_NUM_STAGES,
         NUM_EXPERTS=num_experts,
         VALIDATE_EXPERT_IDS=validate_expert_ids,
+        **pdl_launch_kwargs(),
     )
 
 
@@ -320,7 +322,9 @@ def _triton_copy_routing_and_dispatch(
     ROUTING_CONTIGUOUS: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     VALIDATE_EXPERT_IDS: tl.constexpr,
+    PDL: tl.constexpr,
 ):
+    pdl_wait_then_release(PDL)
     # int64: pid * BLOCK_SIZE wraps int32 once the published payload exceeds 2**31 elements.
     block_start = tl.program_id(0).to(tl.int64) * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)

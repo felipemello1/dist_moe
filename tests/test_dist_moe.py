@@ -6,9 +6,11 @@
 
 """Tests for the BF16 CuTe DSL distributed MoE implementation."""
 
+import contextlib
 import dataclasses
 import datetime
 import tempfile
+import threading
 import unittest
 from functools import partial, wraps
 from typing import Any, Callable, Literal
@@ -17,6 +19,7 @@ from unittest import mock
 import dist_moe
 import dist_moe._blockscaled as blockscaled_impl
 import dist_moe.api as api_impl
+import dist_moe.kernels.pdl as pdl_impl
 import pytest
 import torch
 import torch.distributed as dist
@@ -334,6 +337,28 @@ def _blockscaled_tolerance(
 
 class DistMoeConfigTest(unittest.TestCase):
     """CPU validation tests for the public configuration surface."""
+
+    def test_pdl_launches_is_per_thread_and_restored(self) -> None:
+        """PDL is off by default, nests, is restored after an exception, and stays per thread."""
+        self.assertFalse(pdl_impl.pdl_enabled())
+        with pdl_impl.pdl_launches(True):
+            self.assertEqual(
+                pdl_impl.pdl_launch_kwargs(), {"PDL": True, "launch_pdl": True}
+            )
+            with pdl_impl.pdl_launches(False):
+                self.assertFalse(pdl_impl.pdl_enabled())
+            self.assertTrue(pdl_impl.pdl_enabled())
+            other_thread = []
+            thread = threading.Thread(
+                target=lambda: other_thread.append(pdl_impl.pdl_enabled())
+            )
+            thread.start()
+            thread.join()
+            self.assertEqual(other_thread, [False])
+        with self.assertRaises(RuntimeError):
+            with pdl_impl.pdl_launches(True):
+                raise RuntimeError
+        self.assertFalse(pdl_impl.pdl_enabled())
 
     def test_resource_owner_types_are_factory_only(self) -> None:
         """Factory-owned resource types reject incomplete construction."""
@@ -5128,6 +5153,121 @@ class DistMoeTwoRankTest(unittest.TestCase):
         )
         self.assertCountEqual(seen_wgrads, ["w2", "w13"])
         self.assertEqual(len(preprocess_calls), 4)
+
+    @with_comms
+    def test_bf16_inference_pdl_graph_matches_non_pdl(self) -> None:
+        """PDL-launched BF16 inference replays bitwise equal to launches without PDL.
+
+        Two ranks capture the same four-layer CUDA graph with and without PDL,
+        with non-PDL fill, copy and elementwise nodes between layers, then replay
+        both on new routing (inactive routes, one fully padded rank). Every
+        replay must match exactly. A kernel launched with PDL but without its
+        wait fails here; eager calls usually do not expose it.
+        """
+        rank = dist.get_rank()
+        device = torch.device("cuda", rank)
+        num_experts, top_k, hidden_dim, intermediate_dim, num_tokens = (
+            8,
+            4,
+            1024,
+            512,
+            64,
+        )
+        num_local_experts = num_experts // self.world_size
+        config = dist_moe.Config(
+            max_num_local_input_tokens=num_tokens,
+            num_experts=num_experts,
+            hidden_dim=hidden_dim,
+            intermediate_dim=intermediate_dim,
+            top_k=top_k,
+            max_moe_layers_per_activation_slot=1,
+            device_scratch_capacity_factor=float(self.world_size),
+            inference=True,
+        )
+        context = dist_moe.create_context(group=dist.group.WORLD, config=config)
+        generator = torch.Generator(device=device).manual_seed(11)
+        w13 = (
+            torch.randn(
+                num_local_experts,
+                2 * intermediate_dim,
+                hidden_dim,
+                device=device,
+                generator=generator,
+            )
+            .mul_(hidden_dim**-0.5)
+            .bfloat16()
+        )
+        w2 = (
+            torch.randn(
+                num_local_experts,
+                hidden_dim,
+                intermediate_dim,
+                device=device,
+                generator=generator,
+            )
+            .mul_(intermediate_dim**-0.5)
+            .bfloat16()
+        )
+
+        def capture(pdl: bool):
+            x = torch.zeros(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
+            ids = torch.full((num_tokens, top_k), -1, device=device, dtype=torch.int64)
+            scores = torch.zeros(num_tokens, top_k, device=device)
+            launches = (
+                api_impl.pdl_launches
+                if pdl
+                else lambda enabled: contextlib.nullcontext()
+            )
+            with mock.patch.object(api_impl, "pdl_launches", launches), torch.no_grad():
+                dist_moe.routed_experts(x, ids, scores, w13, w2, context)
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    h = x
+                    for _ in range(4):
+                        scratch = torch.empty_like(h)
+                        scratch.fill_(1.0)
+                        h = dist_moe.routed_experts(h, ids, scores, w13, w2, context)
+                        h = (h.clone() + x) * 0.5
+                        scratch.zero_()
+            return graph, (x, ids, scores), h
+
+        try:
+            pdl_graph, pdl_inputs, pdl_out = capture(pdl=True)
+            plain_graph, plain_inputs, plain_out = capture(pdl=False)
+            mismatched_steps = 0
+            for step in range(6):
+                generator.manual_seed(100 * step + rank)
+                x = torch.randn(
+                    num_tokens, hidden_dim, device=device, generator=generator
+                ).bfloat16()
+                ids = torch.rand(
+                    num_tokens, num_experts, device=device, generator=generator
+                ).argsort(dim=1)[:, :top_k]
+                scores = torch.rand(
+                    num_tokens, top_k, device=device, generator=generator
+                )
+                inactive = (
+                    torch.rand(num_tokens, top_k, device=device, generator=generator)
+                    < 0.3
+                )
+                if rank == 1 and step % 3 == 0:
+                    inactive.fill_(True)
+                ids = ids.masked_fill(inactive, -1)
+                scores = scores.masked_fill(inactive, 0.0)
+                for static in (pdl_inputs, plain_inputs):
+                    for target, value in zip(static, (x, ids, scores)):
+                        target.copy_(value)
+                plain_graph.replay()
+                pdl_graph.replay()
+                torch.cuda.synchronize()
+                dist.barrier()
+                # Both ranks replay every step before asserting, so a mismatch
+                # fails instead of leaving the peer waiting in its next replay.
+                mismatched_steps += not torch.equal(pdl_out, plain_out)
+            self.assertEqual(mismatched_steps, 0)
+        finally:
+            context.close()
 
     @with_comms
     def test_bf16_decode_routing_matches_general_routing(self) -> None:

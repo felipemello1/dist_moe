@@ -21,6 +21,7 @@ from ._buffers import (
     SymmetricMemoryBuffer,
 )
 from .kernels.config import num_sms_per_device
+from .kernels.pdl import pdl_launch_kwargs
 from .kernels.triton.dist_dispatch_routing_kernel import (
     _triton_clear_decode_routing_state,
     _triton_decode_dispatch_routing,
@@ -587,6 +588,7 @@ def _clear_prepared_decode_routing(
         counter_workspace_1_size=workspace_1_size,
         COPY_EXPERT_IDS=copy_expert_ids,
         BLOCK_SIZE=_DECODE_ROUTING_CLEAR_BLOCK_SIZE,
+        **pdl_launch_kwargs(),
     )
 
 
@@ -635,6 +637,7 @@ def launch_prepared_decode_routing(
         NUM_CHUNKS=num_chunks,
         num_warps=max(1, min(block_slots // 32, _DECODE_ROUTING_MAX_WARPS)),
         launch_cooperative_grid=True,
+        **pdl_launch_kwargs(),
     )
     return prepared.output
 

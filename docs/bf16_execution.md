@@ -143,6 +143,11 @@ the same context without a reset. This is distinct from
 | 7 | `dist_grouped_gemm_fprop_combine()` | BF16 `h2` and W2 | BF16 route outputs in peer combine buffers | symmetric peer HBM, optionally copied to the slot | remote stores complete before the following barrier |
 | 8 | postprocess plus `scale_and_sum()` | local route outputs and router scores | BF16 `output_TD` | ordinary local HBM returned to the caller | consumes combine rows after the EP barrier |
 
+In inference the registered op launches this chain with programmatic dependent
+launch (`kernels/pdl.py`): each kernel waits for its predecessor before its first
+global read or write, then lets its successor be scheduled. Launches overlap the
+predecessor's tail; data order is unchanged.
+
 ### 1. Publish route IDs and source activations
 
 `copy_routing_and_dispatch()` places local route IDs and source activations in
