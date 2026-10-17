@@ -94,6 +94,13 @@ def _triton_swiglu_fwd(  # noqa: C901
     ALPHA: tl.constexpr,
     LIMIT: tl.constexpr,
     PDL: tl.constexpr,
+    # Optional per-expert gate/up bias [E, 2D] for rows grouped by expert
+    # (activation-buffer mode); expert_counts_ptr holds the rows per expert.
+    bias_ptr=None,
+    expert_counts_ptr=None,
+    num_bias_experts=1,
+    HAS_BIAS: tl.constexpr = False,
+    BLOCK_E: tl.constexpr = 1,
 ):
     """Unified Triton kernel for SwiGLU forward pass with persistent kernel design.
 
@@ -162,6 +169,15 @@ def _triton_swiglu_fwd(  # noqa: C901
         up_over_acc = tl.zeros((), tl.float32)
         total_acc = tl.zeros((), tl.float32)
 
+    if HAS_BIAS:
+        # expert_ends[e]: first row after expert e's group; a row's expert is
+        # how many of these are <= its index.
+        experts = tl.arange(0, BLOCK_E)
+        expert_counts = tl.load(
+            expert_counts_ptr + experts, mask=experts < num_bias_experts, other=0
+        )
+        expert_ends = tl.cumsum(expert_counts, axis=0)
+
     # Below CTA_CAP, the launch grid still has at least one CTA per active tile.
     num_tiles = tl.cdiv(T, BLOCK_T) * D_TILES
     num_tiles_per_cta = tl.cdiv(num_tiles, CTA_CAP)
@@ -180,6 +196,10 @@ def _triton_swiglu_fwd(  # noqa: C901
         t = (row_tile * BLOCK_T + tl.arange(0, BLOCK_T)).to(tl.int64)
         # Create mask to handle boundary conditions
         mask_t = t < T
+        if HAS_BIAS:
+            row_experts = tl.sum(
+                (expert_ends[None, :] <= t[:, None]).to(tl.int64), axis=1
+            )
 
         # Loop over this tile's columns in blocks of BLOCK_D
         for offset_d in tl.range(d_start, d_end, BLOCK_D):
@@ -199,6 +219,13 @@ def _triton_swiglu_fwd(  # noqa: C901
             y = tl.load(
                 ptr_y + t[:, None] * stride_y_t + d[None, :], mask=mask, other=0.0
             ).to(tl.float32)
+            if HAS_BIAS:
+                # Add in fp32, then round to DTYPE, as a BF16 projection + bias does.
+                bias_rows = bias_ptr + row_experts[:, None] * (2 * D) + d[None, :]
+                gate_bias = tl.load(bias_rows, mask=mask, other=0.0).to(tl.float32)
+                up_bias = tl.load(bias_rows + D, mask=mask, other=0.0).to(tl.float32)
+                x = (x + gate_bias).to(DTYPE).to(tl.float32)
+                y = (y + up_bias).to(DTYPE).to(tl.float32)
 
             if CLAMPED:
                 g = tl.minimum(x, LIMIT)
@@ -289,6 +316,8 @@ def swiglu_fwd(
     alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
     max_rows: int | None = None,
+    bias: torch.Tensor | None = None,
+    num_tokens_per_local_expert: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Fused silu and mul operations.
@@ -328,6 +357,11 @@ def swiglu_fwd(
         max_rows: Optional host upper bound on the device row count in
             activation_buffer mode. It sizes the launch grid, and rows past it
             are never computed, so it must not be smaller than the row count.
+        bias: Optional contiguous per-expert gate/up bias ``[E, 2D]`` in
+            ``dtype``, added to each expert's rows before the activation
+            (activation_buffer mode only); the sum is rounded to ``dtype``.
+        num_tokens_per_local_expert: int32 ``[E]`` rows per expert, in row
+            order; used only with ``bias``.
 
     Returns:
         z: output tensor of shape (T, D), or z (z_offset) when activation_buffer is used.
@@ -374,6 +408,24 @@ def swiglu_fwd(
         )
         clip_stats_out.zero_()
 
+    if bias is not None:
+        if activation_buffer is None or num_tokens_per_local_expert is None:
+            raise ValueError(
+                "bias requires activation_buffer mode and num_tokens_per_local_expert"
+            )
+        num_experts = num_tokens_per_local_expert.shape[0]
+        if num_tokens_per_local_expert.dtype != torch.int32:
+            raise ValueError("num_tokens_per_local_expert must be int32")
+        if (
+            feature_dim is None
+            or tuple(bias.shape) != (num_experts, 2 * feature_dim)
+            or bias.dtype != dtype
+            or not bias.is_contiguous()
+            or bias.device != x.device
+        ):
+            raise ValueError(
+                "bias must be a contiguous [E, 2D] tensor in dtype on the input device"
+            )
     if activation_buffer is not None:
         # Activation buffer mode setup
         # In this mode, x is a byte offset tensor pointing to the input in activation_buffer
@@ -442,6 +494,11 @@ def swiglu_fwd(
             CLAMPED=clamped,
             ALPHA=alpha,
             LIMIT=limit,
+            bias_ptr=bias,
+            expert_counts_ptr=num_tokens_per_local_expert if bias is not None else None,
+            num_bias_experts=1 if bias is None else bias.shape[0],
+            HAS_BIAS=bias is not None,
+            BLOCK_E=1 if bias is None else triton.next_power_of_2(bias.shape[0]),
             **pdl_launch_kwargs(),
         )
 

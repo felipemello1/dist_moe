@@ -220,6 +220,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         use_pdl: bool = False,
         block_major_b: bool = False,
         single_a_tensormap: bool = False,
+        has_bias: bool = False,
     ) -> None:
         if problem_type not in (_FPROP, _DGRAD, _WGRAD):
             raise ValueError(
@@ -260,6 +261,8 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
             raise ValueError(
                 "single_a_tensormap supports non-swapped, unpadded, 1-CTA FPROP only"
             )
+        if has_bias and (problem_type != _FPROP or mode != self.COMBINE):
+            raise ValueError("has_bias supports FPROP COMBINE only")
         super().__init__(
             config=config,
             problem_type=problem_type,
@@ -283,6 +286,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         self.use_pdl = use_pdl
         self.block_major_b = block_major_b
         self.SINGLE_A_TENSORMAP = single_a_tensormap
+        self.has_bias = has_bias
         self.output_accum = output_accum
         # 2CTA needs finer gather granularity because CuTe splits one M
         # tile across CTAs.
@@ -516,10 +520,13 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         BLOCK_SIZE_K: cutlass.Constexpr[int],
         NUM_CTAS: cutlass.Constexpr[int],
         secondary_operands=None,
+        bias_addr_i64: cutlass.Int64 | None = None,
     ):
         """Scatter epilogue consumer (COMBINE mode): TMEM -> registers
         -> epilogue SMEM -> per-row peer scatter.
 
+        With `has_bias`, `bias_addr_i64` points at a ``[G, N]`` bias whose
+        row ``g`` is added to group ``g``'s scattered rows.
         """
         accum_cnt_tile = cutlass.Int32(0)
 
@@ -566,6 +573,14 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
 
             if work.is_valid_tile:
                 g = work.group_idx
+                bias_row_addr_i64 = (
+                    bias_addr_i64
+                    + cutlass.Int64(g)
+                    * cutlass.Int64(N)
+                    * cutlass.Int64(elem_size_bytes_c)
+                    if self.has_bias
+                    else None
+                )
                 while work.is_valid_tile and work.group_idx == g:
                     tmem_buf, tmem_phase = _get_bufidx_phase(
                         accum_cnt_tile, NUM_TMEM_BUFFERS
@@ -779,6 +794,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                                             BLOCK_SIZE_N=BLOCK_SIZE_N,
                                             NUM_CTAS=NUM_CTAS,
                                             cluster_cta_rank=cluster_cta_rank,
+                                            bias_row_addr_i64=bias_row_addr_i64,
                                         )
                                     cute.arch.barrier(
                                         barrier_id=_BAR_EPILOG_SYNC,
@@ -1534,6 +1550,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         # Combine-mode scatter scheduler:
         scatter_ptrs_ptr: cute.Pointer,
         padding_row_ptr: cutlass.Int64,
+        bias_ptr: cutlass.Int64,
         tensormaps: cute.Tensor,
         a_base_ptr: cutlass.Int64,
         b_base_ptr: cutlass.Int64,
@@ -2021,6 +2038,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                     tile_id_smem_ptr=tile_id_smem_ptr,
                     scatter_ptrs_addr_i64=cutlass.Int64(scatter_ptrs_ptr.toint()),
                     padding_row_addr_i64=padding_row_ptr,
+                    bias_addr_i64=bias_ptr,
                     scatter_ptr_smem_ptr=scatter_ptr_smem_ptr,
                     mSwigluOutputWords=mC,
                     fuse_swiglu_fwd=False,
@@ -2112,6 +2130,8 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         scatter_ptrs: cute.Tensor,
         tensormaps: cute.Tensor,
         padding_row_ptr: cutlass.Int64,
+        # COMBINE ``[G, N]`` BF16 bias with `has_bias`; 0 otherwise.
+        bias_ptr: cutlass.Int64,
         a_base_ptr: cutlass.Int64,
         b_base_ptr: cutlass.Int64,
         c_base_ptr: cutlass.Int64,
@@ -2365,6 +2385,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                 a_buff_counter=a_buff_counter,
                 scatter_ptrs_ptr=scatter_ptrs.iterator,
                 padding_row_ptr=padding_row_ptr,
+                bias_ptr=bias_ptr,
                 tensormaps=tensormaps,
                 a_base_ptr=a_base_ptr,
                 b_base_ptr=b_base_ptr,

@@ -139,8 +139,8 @@ the same context without a reset. This is distinct from
 | 3 | `dist_dispatch_routing()` | route IDs and peer base pointers | expert row counts plus gather/scatter pointer tables | ordinary local HBM, saved through backward | follows the publication barrier |
 | 4 | `get_forward_plan()` | row counts and selected activation slot | `need_recompute` plus five byte offsets and a slot-ID snapshot | device planner state, saved through backward | launch ordered; no host read |
 | 5 | `dist_grouped_gemm_fprop_dispatch()` | peer/local BF16 dispatch rows and W13 | gathered `x`, BF16 `h1`, and eligible fused `h2` | `x`/`h1` in the slot or scratch; `h2` always scratch | pointer-driven peer reads after barrier |
-| 6 | standalone `swiglu_fwd()`, when required | BF16 `h1` | BF16 `h2` and optional clip counters | the same planned `h2` destination | same-stream dependency |
-| 7 | `dist_grouped_gemm_fprop_combine()` | BF16 `h2` and W2 | BF16 route outputs in peer combine buffers | symmetric peer HBM, optionally copied to the slot | remote stores complete before the following barrier |
+| 6 | standalone `swiglu_fwd()`, when required | BF16 `h1` and optional W13 bias | BF16 `h2` and optional clip counters | the same planned `h2` destination | same-stream dependency |
+| 7 | `dist_grouped_gemm_fprop_combine()` | BF16 `h2`, W2 and optional W2 bias | BF16 route outputs in peer combine buffers | symmetric peer HBM, optionally copied to the slot | remote stores complete before the following barrier |
 | 8 | postprocess plus `scale_and_sum()` | local route outputs and router scores | BF16 `output_TD` | ordinary local HBM returned to the caller | consumes combine rows after the EP barrier |
 
 In inference the registered op launches this chain with programmatic dependent
@@ -227,8 +227,9 @@ it does not allocate or retain a second weight or activation layout. Both
 `h1` and `h2` are written to the existing planner destinations. Their
 `int64[1]` byte offsets are read on device, not copied to the host.
 
-Forward fusion is selected only when clip counters are absent and the
-resolved preset passes the native geometry check: `F` is divisible by 32,
+Forward fusion is selected only when clip counters and `w13_bias_EF` are
+absent and the resolved preset passes the native geometry check: `F` is
+divisible by 32,
 the preset is non-swapped, its epilogue subtile is 64 columns, and its M tile
 contains 128 rows per CTA MMA atom. Both default training presets meet this
 contract. An incompatible explicit preset or unresolved inference-auto preset

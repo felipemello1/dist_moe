@@ -665,6 +665,20 @@ config = dataclasses.replace(config, block_major_weights=True)
 
 See [the BF16 kernel design](docs/bf16_kernel_design.md#block-major-weights).
 
+### Expert projection biases
+
+BF16 inference can add a per-expert bias after the gate/up and the down
+projections, as GPT-OSS-style experts do:
+
+```python
+options = dist_moe.ExecutionOptions(
+    w13_bias_EF=w13_bias_EF,  # [E_local, 2F] = [gate | up], weight dtype
+    w2_bias_ED=w2_bias_ED,  # [E_local, D]
+)
+```
+
+A W13 bias runs the standalone SwiGLU instead of the fused dispatch epilogue.
+
 ### Clip statistics
 
 BF16 execution can rewrite caller-owned SwiGLU counters on every forward. The

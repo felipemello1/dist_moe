@@ -190,6 +190,8 @@ def _reference_moe(
     clamped: bool = False,
     swiglu_alpha: float = 1.702,
     swiglu_limit: float = 7.0,
+    w13_bias: torch.Tensor | None = None,
+    w2_bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Evaluate a small routed MoE with ordinary PyTorch operations.
 
@@ -203,6 +205,8 @@ def _reference_moe(
         clamped: Whether to apply the clamped SwiGLU formula.
         swiglu_alpha: Sigmoid multiplier for clamped SwiGLU.
         swiglu_limit: Preactivation bound for clamped SwiGLU.
+        w13_bias: Optional gate/up bias ``[E, 2F]`` added after W13.
+        w2_bias: Optional down-projection bias ``[E, D]`` added after W2.
 
     Returns:
         Reference output with shape ``[T, D]``.
@@ -217,6 +221,8 @@ def _reference_moe(
                 token_outputs.append(torch.zeros_like(x[token_index]))
                 continue
             h13 = F.linear(x[token_index], w13[expert])
+            if w13_bias is not None:
+                h13 = h13 + w13_bias[expert]
             gate, up = h13.split(intermediate_dim)
             gate_f32, up_f32 = gate.float(), up.float()
             if clamped:
@@ -234,7 +240,10 @@ def _reference_moe(
                 ).to(x.dtype)
             else:
                 h2 = (gate_f32 * torch.sigmoid(gate_f32) * up_f32).to(x.dtype)
-            token_outputs.append(F.linear(h2, w2[expert]))
+            route = F.linear(h2, w2[expert])
+            if w2_bias is not None:
+                route = route + w2_bias[expert]
+            token_outputs.append(route)
         stacked = torch.stack(token_outputs)
         if experts_output_postprocess is not None:
             stacked = experts_output_postprocess(stacked)
@@ -3393,6 +3402,8 @@ class DistMoeKernelTest(unittest.TestCase):
                     topk_scores_TK,
                     w13_EFD,
                     w2_EDF,
+                    None,
+                    None,
                     *_registered_rmsnorm_args(None),
                     supplied[0],
                     context.activation_buffer.activation_slot_id_1,
@@ -3416,6 +3427,8 @@ class DistMoeKernelTest(unittest.TestCase):
                 topk_scores_TK,
                 w13_EFD,
                 w2_EDF,
+                None,
+                None,
                 *_registered_rmsnorm_args(None),
                 activation_alias,
                 context.activation_buffer.activation_slot_id_1,
@@ -4494,6 +4507,87 @@ class DistMoeKernelTest(unittest.TestCase):
                 row_context.close()
                 block_context.close()
                 torch.testing.assert_close(block_major_TD, row_major_TD, rtol=0, atol=0)
+
+    def test_bf16_inference_projection_biases_match_reference(self) -> None:
+        """BF16 inference adds W13/W2 biases like a BF16 ``projection + bias``.
+
+        Tolerance-based against the PyTorch formula with clamped SwiGLU on 24
+        experts, 8 of which get no rows, and one token whose routes are all
+        ``-1``. Bias std 0.5 moves the output far beyond the tolerance, so a
+        dropped bias fails.
+        """
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+            num_experts=24, activation="swiglu_clamped"
+        )
+        x_TD, topk_expert_ids_TK, topk_scores_TK = case_a
+        topk_expert_ids_TK = topk_expert_ids_TK.clone()
+        topk_scores_TK = topk_scores_TK.clone()
+        topk_expert_ids_TK[0] = -1
+        topk_scores_TK[0] = 0.0
+        w13_bias_EF = 0.5 * torch.randn(
+            w13_EFD.shape[:2], device="cuda", dtype=torch.bfloat16
+        )
+        w2_bias_ED = 0.5 * torch.randn(
+            w2_EDF.shape[:2], device="cuda", dtype=torch.bfloat16
+        )
+        options = dist_moe.ExecutionOptions(
+            w13_bias_EF=w13_bias_EF, w2_bias_ED=w2_bias_ED
+        )
+
+        with torch.inference_mode():
+            actual_TD = dist_moe.routed_experts(
+                x_TD,
+                topk_expert_ids_TK,
+                topk_scores_TK,
+                w13_EFD,
+                w2_EDF,
+                context,
+                options=options,
+            )
+        expected_TD = _reference_moe(
+            x_TD,
+            topk_expert_ids_TK,
+            topk_scores_TK,
+            w13_EFD,
+            w2_EDF,
+            clamped=True,
+            w13_bias=w13_bias_EF,
+            w2_bias=w2_bias_ED,
+        )
+        context.close()
+
+        torch.testing.assert_close(actual_TD, expected_TD, rtol=2e-2, atol=2e-2)
+
+    def test_projection_biases_require_bf16_inference_and_weight_shapes(self) -> None:
+        """Training contexts and wrong-shape biases raise before any launch."""
+        for inference, w13_width_delta, message in (
+            (False, 0, "only by BF16 inference"),
+            (True, 2, "16-byte-aligned"),
+        ):
+            with self.subTest(inference=inference):
+                context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+                    inference=inference
+                )
+                num_experts, w13_width, _ = w13_EFD.shape
+                options = dist_moe.ExecutionOptions(
+                    w13_bias_EF=torch.zeros(
+                        num_experts,
+                        w13_width + w13_width_delta,
+                        device="cuda",
+                        dtype=torch.bfloat16,
+                    ),
+                    w2_bias_ED=torch.zeros(
+                        w2_EDF.shape[:2], device="cuda", dtype=torch.bfloat16
+                    ),
+                )
+                with (
+                    torch.inference_mode(),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    dist_moe.routed_experts(
+                        *case_a, w13_EFD, w2_EDF, context, options=options
+                    )
+                context.close()
 
     def test_two_saved_layers_match_reference_without_recompute(self) -> None:
         """Each layer retains its own post-combine state for score gradients."""
