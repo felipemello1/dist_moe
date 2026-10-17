@@ -30,12 +30,15 @@ from .kernels.triton.dist_dispatch_routing_kernel import (
     _triton_dist_gather_metadata as _gather_routing_metadata_kernel,
 )
 
-# Fused decode routing loads every token/route slot in one CTA. Cap the CTA at
-# 16 warps so the 1024-slot tier uses two slots per thread; larger tiers spill
-# heavily and remain on the general routing pipeline.
-_DECODE_ROUTING_MAX_SLOTS = 1024
+# Fused decode routing gives each source rank one CTA per
+# _DECODE_ROUTING_SLOTS_PER_CTA route slots, at 16 warps (two slots per thread);
+# larger per-CTA tiers spill heavily. _DECODE_ROUTING_MAX_SLOTS (1024 tokens at
+# top-8) covers decode; larger prefill calls take the general routing pipeline.
+# _DECODE_ROUTING_MAX_EXPERTS bounds the per-CTA expert arrays (no spills at 512).
+_DECODE_ROUTING_SLOTS_PER_CTA = 1024
+_DECODE_ROUTING_MAX_SLOTS = 8192
 _DECODE_ROUTING_MAX_WARPS = 16
-_DECODE_ROUTING_MAX_EXPERTS = 256
+_DECODE_ROUTING_MAX_EXPERTS = 512
 _DECODE_ROUTING_CLEAR_BLOCK_SIZE = 256
 _DECODE_COUNTER_WORKSPACE_COUNT = 2
 # The 128-thread, 32-register compactor can keep 16 CTAs resident per SM.
@@ -286,7 +289,6 @@ def _can_use_decode_routing(
     Returns:
         Whether direct decode routing supports the request.
     """
-    num_local_experts = num_experts // world_size
     return (
         use_low_latency
         and expert_id_offset is None
@@ -294,10 +296,15 @@ def _can_use_decode_routing(
         and num_tokens * topk <= _DECODE_ROUTING_MAX_SLOTS
         and num_experts <= _DECODE_ROUTING_MAX_EXPERTS
         and _is_power_of_two(world_size)
-        and _is_power_of_two(num_experts)
-        and _is_power_of_two(num_local_experts)
-        and world_size <= num_sms_per_device()
+        # The cooperative launch needs every CTA resident at once.
+        and world_size * _decode_routing_num_chunks(num_tokens * topk)
+        <= num_sms_per_device()
     )
+
+
+def _decode_routing_num_chunks(num_slots: int) -> int:
+    """Return the CTAs per source rank of a decode routing launch."""
+    return max(1, triton.cdiv(num_slots, _DECODE_ROUTING_SLOTS_PER_CTA))
 
 
 def low_latency_decode_routing_capacity(
@@ -594,8 +601,10 @@ def launch_prepared_decode_routing(
     Returns:
         Routing counts and gather/scatter pointer tables.
     """
-    block_slots = triton.next_power_of_2(prepared.num_tokens * prepared.topk)
-    _triton_decode_dispatch_routing[(prepared.world_size,)](
+    num_slots = prepared.num_tokens * prepared.topk
+    num_chunks = _decode_routing_num_chunks(num_slots)
+    block_slots = min(triton.next_power_of_2(num_slots), _DECODE_ROUTING_SLOTS_PER_CTA)
+    _triton_decode_dispatch_routing[(prepared.world_size * num_chunks,)](
         routing_buffer_ptrs=prepared.routing_buffer.buffer_ptrs_tensor,
         gather_buffer_ptrs=prepared.dispatch_buffer.buffer_ptrs_tensor,
         scatter_buffer_ptrs=prepared.combine_buffer.buffer_ptrs_tensor,
@@ -623,6 +632,7 @@ def launch_prepared_decode_routing(
         BLOCK_EXPERTS=triton.next_power_of_2(prepared.num_experts),
         BLOCK_LOCAL_EXPERTS=triton.next_power_of_2(prepared.num_local_experts),
         BLOCK_WORLD_SIZE=triton.next_power_of_2(prepared.world_size),
+        NUM_CHUNKS=num_chunks,
         num_warps=max(1, min(block_slots // 32, _DECODE_ROUTING_MAX_WARPS)),
         launch_cooperative_grid=True,
     )
