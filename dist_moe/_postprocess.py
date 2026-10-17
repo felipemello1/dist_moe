@@ -509,6 +509,7 @@ def _scale_and_sum(
     x_copy_buffer: torch.Tensor | None = None,
     x_copy_offset: torch.Tensor | None = None,
     x_copy_condition: torch.Tensor | None = None,
+    select_routes: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply router scores and reduce routes, optionally copying the input.
 
@@ -522,6 +523,8 @@ def _scale_and_sum(
         x_copy_buffer: Optional activation buffer containing the saved copy.
         x_copy_offset: Byte offset of the saved copy in ``x_copy_buffer``.
         x_copy_condition: Device predicate controlling the buffer copy.
+        select_routes: Inference only: issue the ID, score and row loads
+            together (``scale_and_sum``).
 
     Returns:
         Reduced output and optional copied route output.
@@ -538,6 +541,7 @@ def _scale_and_sum(
             x_copy_buffer=x_copy_buffer,
             x_copy_offset=x_copy_offset,
             x_copy_condition=x_copy_condition,
+            select_routes=select_routes,
         )
 
     assert x_copy_buffer is None
@@ -802,7 +806,9 @@ def _resolve_experts_output_postprocess_fn(
     _validate_experts_output_postprocess_type(experts_output_postprocess)
     num_tokens, topk = topk_scores_TK.shape
     if experts_output_postprocess is None:
-        return _resolve_reduction_only(num_tokens, topk, topk_expert_ids_TK)
+        return _resolve_reduction_only(
+            num_tokens, topk, topk_expert_ids_TK, inference_mode=inference_mode
+        )
     if callable(experts_output_postprocess):
         return _resolve_callback(
             experts_output_postprocess,
@@ -825,6 +831,8 @@ def _resolve_reduction_only(
     num_tokens: int,
     topk: int,
     expert_ids_TK: torch.Tensor,
+    *,
+    inference_mode: bool = False,
 ) -> _ResolvedExpertsPostprocess:
     """Resolve the plain top-k scale-and-sum stage.
 
@@ -832,6 +840,8 @@ def _resolve_reduction_only(
         num_tokens: Local token count ``T``.
         topk: Routes per token ``K``.
         expert_ids_TK: Routed expert IDs defining active routes.
+        inference_mode: Whether backward is disabled; selects the inference
+            reduction loads.
 
     Returns:
         Forward and backward hooks for reduction without postprocessing.
@@ -894,6 +904,7 @@ def _resolve_reduction_only(
             expert_ids_TK=expert_ids_TK,
             return_copy=save,
             output_dtype=output_dtype,
+            select_routes=inference_mode,
         )
         return output_TD, h3_saved_TKD, None, h3_TKD.dtype
 

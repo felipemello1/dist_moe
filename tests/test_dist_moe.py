@@ -1515,6 +1515,43 @@ class DistMoeBufferTest(unittest.TestCase):
 class DistMoeKernelTest(unittest.TestCase):
     """Numerical tests for CuTe grouped GEMM and distributed MoE."""
 
+    def test_scale_and_sum_selected_routes_match_masked_loads(self) -> None:
+        """The inference route select gives the masked path's exact sum.
+
+        Inactive routes hold NaN rows and NaN scores, as unwritten combine
+        storage and dropped-route scores can; both paths must ignore them and
+        agree bitwise at decode token counts.
+        """
+        from dist_moe.kernels.triton.broadcast_n_reduction import scale_and_sum
+
+        generator = torch.Generator(device="cuda").manual_seed(5)
+        for num_tokens in (1, 64, 128):
+            x = torch.randn(
+                num_tokens, 8, 2048, device="cuda", generator=generator
+            ).bfloat16()
+            scale = torch.rand(num_tokens, 8, device="cuda", generator=generator)
+            expert_ids = torch.randint(
+                0, 256, (num_tokens, 8), device="cuda", generator=generator
+            )
+            inactive = (
+                torch.rand(num_tokens, 8, device="cuda", generator=generator) < 0.4
+            )
+            expert_ids[inactive] = -1
+            x[inactive] = float("nan")
+            scale[inactive] = float("nan")
+            outputs = [
+                scale_and_sum(
+                    x,
+                    scale,
+                    expert_ids=expert_ids,
+                    return_copy=False,
+                    select_routes=select_routes,
+                )[0]
+                for select_routes in (False, True)
+            ]
+            self.assertTrue(torch.isfinite(outputs[0]).all())
+            torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+
     def _run_fake_residual_chain(
         self,
         config: dist_moe.Config,
