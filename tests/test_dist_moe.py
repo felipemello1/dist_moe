@@ -4441,8 +4441,7 @@ class DistMoeKernelTest(unittest.TestCase):
         weights rewritten by ``relayout_to_block_major`` on a context with
         ``block_major_weights``; outputs must be bitwise equal. Cases: the auto
         config at D = F = 256 and at D = 320, F = 192 (a W2 N tail and three K
-        blocks), a 128-row preset that would otherwise fuse SwiGLU into the
-        dispatch epilogue, and a two-CTA preset.
+        blocks), and every BF16 grouped-GEMM preset.
         """
         context, case_a, _, w13_EFD, w2_EDF = self._create_case()
         x_TD, ids_TK, _ = case_a
@@ -4456,7 +4455,7 @@ class DistMoeKernelTest(unittest.TestCase):
                     w2_EDF,
                     dataclasses.replace(context.config, bf16_grouped_gemm_preset=p),
                 )
-                for p in ("1cta1mma_bm128_bn128", "2cta2mma_bm512_bn256")
+                for p in get_args(dist_moe.Bf16GroupedGemmPreset)
             ),
             (
                 (
