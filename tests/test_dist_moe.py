@@ -13,7 +13,7 @@ import tempfile
 import threading
 import unittest
 from functools import partial, wraps
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, get_args
 from unittest import mock
 
 import dist_moe
@@ -3029,6 +3029,25 @@ class DistMoeKernelTest(unittest.TestCase):
                 msg=lambda message, name=name: f"{name}: {message}",
             )
         self._assert_planner_reset(context.activation_buffer)
+
+    def test_bf16_inference_presets_match_default(self) -> None:
+        """Every BF16 grouped-GEMM preset compiles and matches the default bitwise."""
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case(inference=True)
+        with torch.no_grad():
+            expected_TD = dist_moe.routed_experts(*case_a, w13_EFD, w2_EDF, context)
+            for preset in get_args(dist_moe.Bf16GroupedGemmPreset):
+                with self.subTest(preset=preset):
+                    config = dataclasses.replace(
+                        context.config, bf16_grouped_gemm_preset=preset
+                    )
+                    preset_context = dist_moe.create_context(
+                        group=dist.group.WORLD, config=config
+                    )
+                    self.addCleanup(preset_context.close)
+                    actual_TD = dist_moe.routed_experts(
+                        *case_a, w13_EFD, w2_EDF, preset_context
+                    )
+                    torch.testing.assert_close(actual_TD, expected_TD, rtol=0, atol=0)
 
     def test_bf16_callback_accumulates_closed_parameter_grad(self) -> None:
         """Match callback padding sanitation and its closed parameter gradient."""
