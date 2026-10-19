@@ -6,6 +6,7 @@
 
 """CuTe Blackwell grouped-GEMM pipeline config derivation."""
 
+import functools
 import math
 from collections.abc import Callable
 
@@ -2320,6 +2321,9 @@ def _use_deep_prefill_pipeline(
     )
 
 
+# Memoized: the launcher resolves its config on every launch, and an auto
+# config walks every candidate tile (~150 us of Python).
+@functools.lru_cache(maxsize=1024)
 def _resolve_dist_grouped_gemm_config(
     *,
     config: str | None,
