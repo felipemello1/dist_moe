@@ -108,6 +108,9 @@ class BlockScaledProducer(enum.IntEnum):
 SWIGLU_CLAMP_ALPHA_DEFAULT = 1.702
 SWIGLU_CLAMP_LIMIT_DEFAULT = 7.0
 
+# Block-major BF16 weights store K in blocks of 64 elements: one 128-byte TMA row.
+BLOCK_MAJOR_K = 64
+
 
 def canonical_swiglu_clamp(
     clamped: bool,

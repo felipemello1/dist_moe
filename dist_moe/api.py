@@ -66,6 +66,7 @@ from .formats import (
     _NVFP4_DIM_MULTIPLE,
     _NVFP4_HIDDEN_DIM_MAX,
     _NVFP4_INTERMEDIATE_DIM_MAX,
+    BLOCK_MAJOR_K,
     block_scaled_format_constants,
     SWIGLU_CLAMP_ALPHA_DEFAULT,
     SWIGLU_CLAMP_LIMIT_DEFAULT,
@@ -92,6 +93,7 @@ __all__ = [
     "create_context",
     "plan_memory",
     "prepare_block_scaled_weight",
+    "relayout_to_block_major",
     "RMSNormPostprocess",
     "routed_experts",
     "supports_fused_post_expert_rmsnorm",
@@ -382,6 +384,11 @@ class Config:
             inference routing, layouts, formats, and scratch-only planning.
             Per-call `torch.no_grad()` evaluation on a training context is
             supported independently and does not consume activation slots.
+        block_major_weights: Whether every W13 and W2 passed to this context
+            was rewritten by :func:`relayout_to_block_major`, which streams
+            faster. BF16 inference only (training backward reads row-major
+            weights); ``intermediate_dim`` must be a multiple of 64. Weight
+            callbacks receive the stored block-major tensors.
     """
 
     max_num_local_input_tokens: int
@@ -403,6 +410,7 @@ class Config:
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT
     wgrad_dtype: torch.dtype | None = None
     inference: bool = False
+    block_major_weights: bool = False
 
     def __post_init__(self) -> None:  # noqa: C901
         """Validate static execution parameters.
@@ -480,6 +488,15 @@ class Config:
             )
         if self.num_sms is not None and self.num_sms <= 0:
             raise ValueError("num_sms must be positive when specified")
+        if self.block_major_weights and (
+            not self.inference
+            or self.block_scaled is not None
+            or self.intermediate_dim % BLOCK_MAJOR_K != 0
+        ):
+            raise ValueError(
+                "block_major_weights requires BF16 inference and an "
+                "intermediate_dim that is a multiple of 64"
+            )
         if (
             self.bf16_grouped_gemm_preset is not None
             and self.bf16_grouped_gemm_preset not in _BF16_GROUPED_GEMM_CONFIGS
@@ -2057,6 +2074,7 @@ class _Bf16Autograd(torch.autograd.Function):
         )
         fused_swiglu_forward = (
             options.swiglu_clip_stats_out_3 is None
+            and not config.block_major_weights
             and fprop_config is not None
             and _native_swiglu_fwd_config_is_compatible(fprop_config, w2_EDF.shape[2])
         )
@@ -2097,9 +2115,11 @@ class _Bf16Autograd(torch.autograd.Function):
                 swiglu_alpha=config.swiglu_alpha,
                 swiglu_limit=config.swiglu_limit,
                 precleared_counter_storage=dispatch_counter_storage,
+                block_major_weights=config.block_major_weights,
             )
-            # Clip observation and unsupported explicit presets retain the
-            # standalone activation; eligible dispatch emits both H1 and H2.
+            # Clip observation, block-major weights and unsupported explicit
+            # presets retain the standalone activation; eligible dispatch emits
+            # both H1 and H2.
             if not fused_swiglu_forward:
                 # A token picks each expert at most once, so every peer sends at
                 # most min(top_k, local experts) routes per token.
@@ -2133,6 +2153,7 @@ class _Bf16Autograd(torch.autograd.Function):
                 config=combine_config,
                 estimate_recv_num_tokens=estimated_num_recv_rows,
                 precleared_counter_storage=combine_counter_storage,
+                block_major_weights=config.block_major_weights,
             )
             h3_MD = h3_MD.view(-1, context.hidden_dim)[
                 : num_local_input_tokens * context.top_k
@@ -4131,6 +4152,46 @@ def routed_experts(  # noqa: C901
         options.validate_expert_ids,
         context.context_id,
     )
+
+
+def relayout_to_block_major(weight: torch.Tensor) -> None:
+    """Rewrite each expert's ``[N, K]`` weight in place as ``[K / 64, N, 64]``.
+
+    This is the layout a context with ``Config.block_major_weights`` reads.
+    The shape is unchanged, so afterwards only Dist-MoE may read the weight, and
+    a second call permutes it again. With ``K = 128``::
+
+        row-major:    r0[0:64] r0[64:128] r1[0:64] r1[64:128] ...
+        block-major:  r0[0:64] r1[0:64] ... r(N-1)[0:64] r0[64:128] r1[64:128] ...
+
+    Args:
+        weight: Contiguous expert weight ``[E, N, K]``: ``[E, 2F, D]`` for W13,
+            ``[E, D, F]`` for W2. K must be a multiple of 64.
+
+    Raises:
+        ValueError: If ``weight`` is not a contiguous 3-D tensor with K a
+            multiple of 64.
+    """
+    if (
+        weight.ndim != 3
+        or not weight.is_contiguous()
+        or weight.shape[2] % BLOCK_MAJOR_K != 0
+    ):
+        raise ValueError(
+            "relayout_to_block_major needs a contiguous [E, N, K] weight whose K "
+            "is a multiple of 64"
+        )
+    num_rows, k = weight.shape[1:]
+    # One expert at a time: the temp is one [N, K] weight, not a second copy.
+    block_BN64 = weight.new_empty(k // BLOCK_MAJOR_K, num_rows, BLOCK_MAJOR_K)
+    with torch.inference_mode():
+        for weight_NK in weight:
+            block_BN64.copy_(
+                weight_NK.view(num_rows, k // BLOCK_MAJOR_K, BLOCK_MAJOR_K).transpose(
+                    0, 1
+                )
+            )
+            weight_NK.view(block_BN64.shape).copy_(block_BN64)
 
 
 def prepare_block_scaled_weight(

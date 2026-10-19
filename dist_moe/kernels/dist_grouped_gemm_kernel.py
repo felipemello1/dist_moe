@@ -13,6 +13,7 @@ import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync
 
 from ..formats import (
+    BLOCK_MAJOR_K,
     SWIGLU_CLAMP_ALPHA_DEFAULT,
     SWIGLU_CLAMP_LIMIT_DEFAULT,
 )
@@ -217,6 +218,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         swiglu_emit_h1: bool = False,
         gather_k_segments: int = _GATHER_K_SEGMENTS,
         use_pdl: bool = False,
+        block_major_b: bool = False,
     ) -> None:
         if problem_type not in (_FPROP, _DGRAD, _WGRAD):
             raise ValueError(
@@ -246,6 +248,8 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
             or mode not in (self.DISPATCH, self.DISPATCH_SWIGLU_FWD)
         ):
             raise ValueError("distributed SWAP_AB supports FPROP dispatch only")
+        if block_major_b and (problem_type != _FPROP or swap_ab or swiglu_emit_h1):
+            raise ValueError("block_major_b supports non-swapped FPROP without emit_h1")
         super().__init__(
             config=config,
             problem_type=problem_type,
@@ -267,6 +271,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         self.swiglu_emit_h1 = swiglu_emit_h1
         self.has_padding_sentinels = has_padding_sentinels
         self.use_pdl = use_pdl
+        self.block_major_b = block_major_b
         self.output_accum = output_accum
         # 2CTA needs finer gather granularity because CuTe splits one M
         # tile across CTAs.
@@ -2169,6 +2174,18 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         self.c_dtype = tensor_c.element_type
         self.a_major_mode = utils.LayoutEnum.from_tensor(tensor_a).mma_major_mode()
         self.b_major_mode = utils.LayoutEnum.from_tensor(tensor_b).mma_major_mode()
+        if cutlass.const_expr(self.block_major_b):
+            # Each group's [N, K] weight is stored as [K / 64, N, 64]: view the
+            # (N, K, G) operand with a two-level K mode so a 64-wide K tile of
+            # BLOCK_SIZE_N rows is one contiguous TMA box.
+            n_b, k_b, g_b = tensor_b.shape
+            tensor_b = cute.make_tensor(
+                tensor_b.iterator,
+                cute.make_layout(
+                    (n_b, (BLOCK_MAJOR_K, k_b // BLOCK_MAJOR_K), g_b),
+                    stride=(BLOCK_MAJOR_K, (1, BLOCK_MAJOR_K * n_b), n_b * k_b),
+                ),
+            )
         self.c_layout = utils.LayoutEnum.from_tensor(tensor_c)
 
         from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode

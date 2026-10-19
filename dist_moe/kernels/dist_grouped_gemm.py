@@ -31,6 +31,7 @@ from .._activation_buffer_planner_kernel import (
     MEMORY_ALIGNMENT as _ACTIVATION_BUFFER_ALIGNMENT,
 )
 from ..formats import (
+    BLOCK_MAJOR_K,
     canonical_swiglu_clamp,
     SWIGLU_CLAMP_ALPHA_DEFAULT,
     SWIGLU_CLAMP_LIMIT_DEFAULT,
@@ -236,6 +237,7 @@ def _get_dist_kernel(
     swiglu_emit_h2: bool = False,
     swiglu_emit_h1: bool = False,
     use_pdl: bool = False,
+    block_major_b: bool = False,
 ) -> DistGroupedGemmKernel:
     """Return a cached kernel with the exact scheduling and SwiGLU controls."""
     swiglu_clamped, swiglu_alpha, swiglu_limit = canonical_swiglu_clamp(
@@ -261,6 +263,7 @@ def _get_dist_kernel(
         swiglu_emit_h2,
         swiglu_emit_h1,
         use_pdl,
+        block_major_b,
     )
     obj = _DIST_KERNEL_CACHE.get(key)
     if obj is None:
@@ -284,6 +287,7 @@ def _get_dist_kernel(
             swiglu_emit_h1=swiglu_emit_h1,
             gather_k_segments=gather_k_segments,
             use_pdl=use_pdl,
+            block_major_b=block_major_b,
         )
         _DIST_KERNEL_CACHE[key] = obj
     return obj
@@ -465,6 +469,8 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
     # DISPATCH_SWIGLU_FWD from natural (unswizzled) W13: also write the
     # natural h1 into `y` and return `(y, x_gathered)`.
     swiglu_emit_h1: bool = False,
+    # FPROP: weights rewritten by `relayout_to_block_major`.
+    block_major_weights: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused-kernel impl: launches DistGroupedGemmKernel directly.
 
@@ -738,6 +744,16 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
     )
     if swap_ab and use_activation_buffer:
         raise ValueError("distributed SWAP_AB does not support activation_buffer")
+    # The kernel rejects the other unsupported modes when it is built.
+    if block_major_weights and (
+        kernel_override is not None
+        or not w.is_contiguous()
+        or w.shape[2] % BLOCK_MAJOR_K != 0
+    ):
+        raise ValueError(
+            "block_major_weights needs no kernel override and contiguous weights "
+            "whose K is a multiple of 64"
+        )
     if swiglu_emit_h1 and not _native_swiglu_fwd_config_is_compatible(
         config, out_dim // 2
     ):
@@ -829,6 +845,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
             swiglu_emit_h2=swiglu_emit_h2,
             swiglu_emit_h1=swiglu_emit_h1,
             use_pdl=pdl_enabled(),
+            block_major_b=block_major_weights,
         )
     else:
         kernel = kernel_override
@@ -1073,6 +1090,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
         kernel.swiglu_emit_h1,
         kernel.GATHER_K_SEGMENTS,
         kernel.use_pdl,
+        kernel.block_major_b,
     )
     # Kernel-logical axes depend on problem_type:
     #   FPROP: out=N_w, in=K_w    → kernel (kernel_M, N_w, K_w)
@@ -1229,6 +1247,7 @@ def dist_grouped_gemm_fprop_dispatch(
     swiglu_clamped: bool = False,
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
+    block_major_weights: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Distributed grouped GEMM fprop dispatch: gather A from peers, GEMM.
 
@@ -1257,6 +1276,9 @@ def dist_grouped_gemm_fprop_dispatch(
     `precleared_counter_storage`, when given, holds int32 counters the caller
     zeroed before this launch (`allocate_activation_buffer_counter_storage`);
     the launch then skips its own memset.
+
+    `block_major_weights` reads weights rewritten by `relayout_to_block_major`
+    (`Config.block_major_weights`).
 
     Returns: (y_out, x_out), or the original (y_offset, x_gathered_offset)
     tensors when activation_buffer is provided.
@@ -1297,6 +1319,7 @@ def dist_grouped_gemm_fprop_dispatch(
         swiglu_clamped=emit_swiglu and swiglu_clamped,
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
+        block_major_weights=block_major_weights,
     )
 
 
@@ -1574,6 +1597,7 @@ def dist_grouped_gemm_fprop_combine(
     precleared_counter_storage: torch.Tensor | None = None,
     m_multiple_of: int | None = None,
     pre_shuffled_rows: bool = False,
+    block_major_weights: bool = False,
 ) -> torch.Tensor:
     """Distributed grouped GEMM forward combine: fused GEMM + scatter.
 
@@ -1584,7 +1608,8 @@ def dist_grouped_gemm_fprop_combine(
     tensor; kernel patches its A-tensor TMA descriptor at runtime.
     Addresses must be 128-byte aligned.
 
-    `precleared_counter_storage` follows the dispatch launch's contract.
+    `precleared_counter_storage` and `block_major_weights` follow the dispatch
+    launch's contract.
 
     The caller owns all peer synchronization.
     """
@@ -1617,6 +1642,7 @@ def dist_grouped_gemm_fprop_combine(
         pre_shuffled_rows=pre_shuffled_rows,
         precleared_counter_storage=precleared_counter_storage,
         m_multiple_of=m_multiple_of,
+        block_major_weights=block_major_weights,
     )
     return symm_mem_buffer.local()
 
