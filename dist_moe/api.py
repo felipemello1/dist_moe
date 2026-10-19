@@ -2116,6 +2116,7 @@ class _Bf16Autograd(torch.autograd.Function):
                 swiglu_limit=config.swiglu_limit,
                 precleared_counter_storage=dispatch_counter_storage,
                 block_major_weights=config.block_major_weights,
+                single_a_tensormap=config.inference,
             )
             # Clip observation, block-major weights and unsupported explicit
             # presets retain the standalone activation; eligible dispatch emits
@@ -2154,6 +2155,7 @@ class _Bf16Autograd(torch.autograd.Function):
                 estimate_recv_num_tokens=estimated_num_recv_rows,
                 precleared_counter_storage=combine_counter_storage,
                 block_major_weights=config.block_major_weights,
+                single_a_tensormap=config.inference,
             )
             h3_MD = h3_MD.view(-1, context.hidden_dim)[
                 : num_local_input_tokens * context.top_k

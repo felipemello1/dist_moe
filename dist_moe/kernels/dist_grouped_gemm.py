@@ -238,6 +238,7 @@ def _get_dist_kernel(
     swiglu_emit_h1: bool = False,
     use_pdl: bool = False,
     block_major_b: bool = False,
+    single_a_tensormap: bool = False,
 ) -> DistGroupedGemmKernel:
     """Return a cached kernel with the exact scheduling and SwiGLU controls."""
     swiglu_clamped, swiglu_alpha, swiglu_limit = canonical_swiglu_clamp(
@@ -264,6 +265,7 @@ def _get_dist_kernel(
         swiglu_emit_h1,
         use_pdl,
         block_major_b,
+        single_a_tensormap,
     )
     obj = _DIST_KERNEL_CACHE.get(key)
     if obj is None:
@@ -288,6 +290,7 @@ def _get_dist_kernel(
             gather_k_segments=gather_k_segments,
             use_pdl=use_pdl,
             block_major_b=block_major_b,
+            single_a_tensormap=single_a_tensormap,
         )
         _DIST_KERNEL_CACHE[key] = obj
     return obj
@@ -471,6 +474,9 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
     swiglu_emit_h1: bool = False,
     # FPROP: weights rewritten by `relayout_to_block_major`.
     block_major_weights: bool = False,
+    # FPROP: read A through one descriptor when the launch allows it (see
+    # GroupedGemmKernel.SINGLE_A_TENSORMAP); otherwise per-group descriptors.
+    single_a_tensormap: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused-kernel impl: launches DistGroupedGemmKernel directly.
 
@@ -775,6 +781,12 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
     token_tile = int(cfg["BLOCK_SIZE_N"] if swap_ab else cfg["BLOCK_SIZE_M"])
     has_padded_activation = m_multiple_of is not None and not use_activation_buffer
     host_a_tensormap = has_padded_activation and not swap_ab
+    # Other launches keep a per-group A descriptor (the kernel rejects these).
+    single_a_tensormap = (
+        single_a_tensormap
+        and problem_type == _FPROP
+        and not (swap_ab or host_a_tensormap or cfg["NUM_CTAS"] != 1)
+    )
     has_padding_sentinels = has_padding_sentinels or has_padded_activation
     if has_padded_activation and m_multiple_of % token_tile != 0:
         raise ValueError(
@@ -846,6 +858,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
             swiglu_emit_h1=swiglu_emit_h1,
             use_pdl=pdl_enabled(),
             block_major_b=block_major_weights,
+            single_a_tensormap=single_a_tensormap,
         )
     else:
         kernel = kernel_override
@@ -1091,6 +1104,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
         kernel.GATHER_K_SEGMENTS,
         kernel.use_pdl,
         kernel.block_major_b,
+        kernel.SINGLE_A_TENSORMAP,
     )
     # Kernel-logical axes depend on problem_type:
     #   FPROP: out=N_w, in=K_w    → kernel (kernel_M, N_w, K_w)
@@ -1248,6 +1262,7 @@ def dist_grouped_gemm_fprop_dispatch(
     swiglu_alpha: float = SWIGLU_CLAMP_ALPHA_DEFAULT,
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
     block_major_weights: bool = False,
+    single_a_tensormap: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Distributed grouped GEMM fprop dispatch: gather A from peers, GEMM.
 
@@ -1261,7 +1276,10 @@ def dist_grouped_gemm_fprop_dispatch(
 
     When `activation_buffer` is provided, `y` and `x_gathered` must be
     int64[1] device tensors holding byte offsets into the buffer (kernel
-    patches TMA descriptors at runtime). The caller must pre-stage `x` to
+    patches TMA descriptors at runtime). `single_a_tensormap=True` patches
+    the A descriptor once per CTA instead of once per expert when the launch
+    allows it (non-swapped, unpadded, 1-CTA); otherwise it is ignored. The
+    caller must pre-stage `x` to
     symm-mem and barrier the EP group before this launch. Addresses must
     be 128-byte aligned.
 
@@ -1320,6 +1338,7 @@ def dist_grouped_gemm_fprop_dispatch(
         swiglu_alpha=swiglu_alpha,
         swiglu_limit=swiglu_limit,
         block_major_weights=block_major_weights,
+        single_a_tensormap=single_a_tensormap,
     )
 
 
@@ -1598,6 +1617,7 @@ def dist_grouped_gemm_fprop_combine(
     m_multiple_of: int | None = None,
     pre_shuffled_rows: bool = False,
     block_major_weights: bool = False,
+    single_a_tensormap: bool = False,
 ) -> torch.Tensor:
     """Distributed grouped GEMM forward combine: fused GEMM + scatter.
 
@@ -1605,7 +1625,8 @@ def dist_grouped_gemm_fprop_combine(
     GEMM outputs in via `scatter_ptrs`).
 
     When `activation_buffer` is provided, `x` is an int64[1] byte-offset
-    tensor; kernel patches its A-tensor TMA descriptor at runtime.
+    tensor; kernel patches its A-tensor TMA descriptor at runtime, once per
+    CTA with `single_a_tensormap` (same rule as the dispatch launch).
     Addresses must be 128-byte aligned.
 
     `precleared_counter_storage` and `block_major_weights` follow the dispatch
@@ -1643,6 +1664,7 @@ def dist_grouped_gemm_fprop_combine(
         precleared_counter_storage=precleared_counter_storage,
         m_multiple_of=m_multiple_of,
         block_major_weights=block_major_weights,
+        single_a_tensormap=single_a_tensormap,
     )
     return symm_mem_buffer.local()
 

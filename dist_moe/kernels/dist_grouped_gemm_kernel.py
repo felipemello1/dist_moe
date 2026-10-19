@@ -219,6 +219,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         gather_k_segments: int = _GATHER_K_SEGMENTS,
         use_pdl: bool = False,
         block_major_b: bool = False,
+        single_a_tensormap: bool = False,
     ) -> None:
         if problem_type not in (_FPROP, _DGRAD, _WGRAD):
             raise ValueError(
@@ -250,6 +251,15 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
             raise ValueError("distributed SWAP_AB supports FPROP dispatch only")
         if block_major_b and (problem_type != _FPROP or swap_ab or swiglu_emit_h1):
             raise ValueError("block_major_b supports non-swapped FPROP without emit_h1")
+        if single_a_tensormap and (
+            problem_type != _FPROP
+            or swap_ab
+            or host_a_tensormap
+            or config["NUM_CTAS"] != 1
+        ):
+            raise ValueError(
+                "single_a_tensormap supports non-swapped, unpadded, 1-CTA FPROP only"
+            )
         super().__init__(
             config=config,
             problem_type=problem_type,
@@ -272,6 +282,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         self.has_padding_sentinels = has_padding_sentinels
         self.use_pdl = use_pdl
         self.block_major_b = block_major_b
+        self.SINGLE_A_TENSORMAP = single_a_tensormap
         self.output_accum = output_accum
         # 2CTA needs finer gather granularity because CuTe splits one M
         # tile across CTAs.
@@ -1306,6 +1317,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                     BLOCK_SIZE_K=BLOCK_SIZE_K,
                     NUM_CTAS=NUM_CTAS,
                     secondary_operands=secondary_operands,
+                    a_coord_layout=mA.layout,
                 )
         elif warp_idx == DIST_MMA_WARP_ID:  # MMA consumer
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
@@ -1925,6 +1937,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                     BLOCK_SIZE_N=BLOCK_SIZE_N,
                     BLOCK_SIZE_K=BLOCK_SIZE_K,
                     NUM_CTAS=NUM_CTAS,
+                    a_coord_layout=mA.layout,
                 )
         elif warp_idx == DIST_MMA_WARP_ID:  # MMA consumer
             tmem_ptr = cute.arch.retrieve_tmem_ptr(

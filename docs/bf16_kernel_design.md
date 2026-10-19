@@ -55,6 +55,16 @@ depth, epilogue subdivision, and static or dynamic scheduling. These choices
 are compile-time CuTe parameters and form a performance-sensitive
 specialization contract.
 
+Training and backward patch the activation (A) TMA descriptor once per expert,
+after the previous expert's last load lands. BF16 inference FPROP (one-CTA,
+non-swapped, unpadded) instead patches one descriptor per CTA over every
+expert's rows and addresses expert `e` at row `sum(split_sizes[:e])`, so decode
+tiles, whose consecutive tiles belong to different experts, skip the patch, the
+fence and the wait. A tile's last rows may then load the next expert's rows:
+each output row depends only on its own A row, and every epilogue stores only
+rows below that expert's `split_sizes[e]`. The descriptor extent is the exact
+row total, so TMA zero-fills past the last expert.
+
 <a id="block-major-weights"></a>
 ## Block-major weights
 
