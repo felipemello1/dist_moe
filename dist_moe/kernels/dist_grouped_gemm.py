@@ -41,6 +41,7 @@ from ._grouped_gemm_config import (
     NATIVE_SWIGLU_EMIT_H1_GROUP_SIZE,
     NATIVE_SWIGLU_EPILOGUE_TILE_N_MULTIPLE,
 )
+from ._quack_compile_utils import make_fake_stream
 from .config import (  # noqa: F401
     _activation_m_multiple,
     _DEEP_PREFILL_PIPELINE_MAX_OUTPUT_DIM,
@@ -90,6 +91,7 @@ from .dist_grouped_gemm_kernel import (
 from .grouped_gemm import (
     _allocate_workspace,
     _compile_or_get,
+    _COMPILED_CACHE,
     _DGRAD,
     _FPROP,
     _torch_layout_signature,
@@ -891,37 +893,19 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
     )
     a_placeholder = a_input.detach().unsqueeze(-1)
     c_placeholder = y.detach().unsqueeze(-1)
-    a_cute = from_dlpack(
-        a_placeholder, assumed_align=placeholder_align
-    ).mark_layout_dynamic(leading_dim=1)
-    c_cute = from_dlpack(
-        c_placeholder, assumed_align=placeholder_align
-    ).mark_layout_dynamic(leading_dim=1)
     if problem_type == _FPROP:
         # B = w view (N, K, G), K-major (stride[1]=1). Caller-provided
         # weight tensor — fresh torch allocation, only assume the
         # conservative caching-allocator minimum.
         b_placeholder = w.detach().permute(1, 2, 0)
-        b_cute = from_dlpack(
-            b_placeholder, assumed_align=_PYTORCH_ALLOCATOR_MIN_ALIGNMENT
-        ).mark_layout_dynamic(leading_dim=1)
+        b_leading_dim = 1
         b_s0_val = int(w.stride(1))
         b_s1_val = int(w.stride(2))
     else:  # _DGRAD: B is w viewed as MN-major (K_in, N, G) — stride[0]=1.
         b_placeholder = w.detach().permute(2, 1, 0)
-        b_cute = from_dlpack(
-            b_placeholder, assumed_align=_PYTORCH_ALLOCATOR_MIN_ALIGNMENT
-        ).mark_layout_dynamic(leading_dim=0)
+        b_leading_dim = 0
         b_s0_val = 1
         b_s1_val = int(K)  # K_in (= w.shape[2])
-    # Tensors below are dtype-natural alignment for cute.arch.load: int32
-    # → 4-byte, int64 → 8-byte. These are not subject to the buffer
-    # alignment contract because the kernel reads them as plain scalars,
-    # not as TMA-vectorized tiles.
-    split_cute = from_dlpack(split_sizes.detach(), assumed_align=4)
-    counter_cute = from_dlpack(counter, assumed_align=4)
-    gather_counter_cute = from_dlpack(gather_counter, assumed_align=4)
-    a_buff_counter_cute = from_dlpack(a_buff_counter, assumed_align=4)
     if use_fused_swiglu_dispatch:
         assert swiglu_output is not None
         if use_activation_buffer:
@@ -940,16 +924,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
         # This branch is compile-time dead, but CuTe still requires a rank-2
         # int32 tensor with the same compile/runtime layout.
         h2_words = counter.view(1, 1)
-    # Int64 row stride: the h2 store's Int32 row * (N // 4) can pass 2**31.
-    h2_words_cute = from_dlpack(h2_words, assumed_align=16).mark_layout_dynamic(
-        leading_dim=1
-    )
-    peer_ptrs_cute = from_dlpack(peer_ptrs.detach(), assumed_align=8)
-    scatter_ptrs_cute = from_dlpack(
-        (scatter_ptrs if scatter_ptrs is not None else peer_ptrs).detach(),
-        assumed_align=8,
-    )
-    tensormaps_cute = from_dlpack(tensormaps, assumed_align=8)
+    kernel_scatter_ptrs = scatter_ptrs if scatter_ptrs is not None else peer_ptrs
 
     secondary_compile_args: tuple = ()
     secondary_runtime_args: tuple = ()
@@ -959,7 +934,6 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
         assert secondary_ready_counter is not None
         assert secondary_ready_feature_tiles is not None
         assert swiglu_output is not None
-        ready_cute = from_dlpack(secondary_ready_counter, assumed_align=4)
         secondary_compile_args = (
             cutlass.Int64(secondary_weight.data_ptr()),
             cutlass.Int64(swiglu_output.data_ptr()),
@@ -967,17 +941,27 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
             cutlass.Int32(secondary_weight.stride(2)),
             cutlass.Int32(swiglu_output.stride(0)),
             cutlass.Int32(swiglu_output.stride(1)),
-            ready_cute,
+            secondary_ready_counter,
             cutlass.Int32(secondary_ready_feature_tiles),
         )
-        secondary_runtime_args = secondary_compile_args
+        secondary_runtime_args = (
+            secondary_weight.data_ptr(),
+            swiglu_output.data_ptr(),
+            secondary_weight.stride(1),
+            secondary_weight.stride(2),
+            swiglu_output.stride(0),
+            swiglu_output.stride(1),
+            secondary_ready_counter,
+            secondary_ready_feature_tiles,
+        )
         secondary_layout_key = (
             _torch_layout_signature(secondary_weight),
             _torch_layout_signature(swiglu_output),
         )
 
-    # Inactive offset arguments are compile-time dead.
-    dummy_offset = peer_ptrs[:1]
+    # Inactive offset arguments are compile-time dead. They get their own (1,)
+    # tensor: TVM FFI checks that compiled shape, and the pointer table can be empty.
+    dummy_offset = torch.empty(1, dtype=torch.int64, device=peer_ptrs.device)
     if use_activation_buffer:
         if is_dispatch:
             output_offset_for_kernel = output_offset_t
@@ -999,17 +983,6 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
         swiglu_output_offset_for_kernel = dummy_offset
         activation_buffer_base_ptr_i64 = 0
         activation_buffer_size_bytes = 0
-    # ALIGNMENT CONTRACT: the offset value (not the tensor) must come
-    # from the activation-buffer planner so that
-    # `activation_buffer.data_ptr() + offsets_ptr[0]` is
-    # `_ACTIVATION_BUFFER_ALIGNMENT`-aligned for downstream TMA. The
-    # offset tensor itself only carries 8-byte alignment.
-    output_offsets_cute = from_dlpack(output_offset_for_kernel, assumed_align=8)
-    gathered_offsets_cute = from_dlpack(gathered_offset_for_kernel, assumed_align=8)
-    input_offsets_cute = from_dlpack(input_offset_for_kernel, assumed_align=8)
-    swiglu_output_offsets_cute = from_dlpack(
-        swiglu_output_offset_for_kernel, assumed_align=8
-    )
 
     # Conditional execution: caller threads a device int32[1] flag;
     # kernel returns early if the flag is 0. Caller passes None to
@@ -1036,40 +1009,25 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
             cond_tensor = conditional_execution
     else:
         cond_tensor = counter
-    cond_cute = from_dlpack(cond_tensor, assumed_align=4)
 
     if use_fused_swiglu_bwd:
         assert swiglu_dz is not None and swiglu_h1 is not None
         swiglu_args = (
-            cutlass.Int64(0 if use_activation_buffer else swiglu_dz.data_ptr()),
-            cutlass.Int64(0 if use_activation_buffer else swiglu_h1.data_ptr()),
-            cutlass.Int32(
-                in_dim // 2 if use_activation_buffer else swiglu_dz.stride(0)
-            ),
-            cutlass.Int32(in_dim if use_activation_buffer else swiglu_h1.stride(0)),
+            0 if use_activation_buffer else swiglu_dz.data_ptr(),
+            0 if use_activation_buffer else swiglu_h1.data_ptr(),
+            in_dim // 2 if use_activation_buffer else swiglu_dz.stride(0),
+            in_dim if use_activation_buffer else swiglu_h1.stride(0),
         )
     else:
-        swiglu_args = (
-            cutlass.Int64(0),
-            cutlass.Int64(0),
-            cutlass.Int32(0),
-            cutlass.Int32(0),
-        )
-
-    swiglu_dz_offsets_cute = from_dlpack(
-        swiglu_dz if use_fused_swiglu_bwd and use_activation_buffer else dummy_offset,
-        assumed_align=8,
-    )
-    swiglu_h1_offsets_cute = from_dlpack(
-        swiglu_h1 if use_fused_swiglu_bwd and use_activation_buffer else dummy_offset,
-        assumed_align=8,
-    )
+        swiglu_args = (0, 0, 0, 0)
+    use_swiglu_offsets = use_fused_swiglu_bwd and use_activation_buffer
+    swiglu_dz_offsets = swiglu_dz if use_swiglu_offsets else dummy_offset
+    swiglu_h1_offsets = swiglu_h1 if use_swiglu_offsets else dummy_offset
 
     # CORRECTNESS: with activation_buffer, `x` may be an int64[1] offset
     # tensor; reading elem from it would give 8 instead of the actual A
     # dtype size and break TMA stride math. Read from `a_input` instead.
     elem = a_input.element_size() if use_activation_buffer else x.element_size()
-    stream = cutlass_torch.current_stream()
     cache_key = (
         config,
         problem_type,
@@ -1117,67 +1075,22 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
     else:  # _DGRAD
         kernel_N = int(K)
         kernel_K = int(N)
-    compile_args = (
-        a_cute,
-        b_cute,
-        c_cute,
-        split_cute,
-        counter_cute,
-        gather_counter_cute,
-        a_buff_counter_cute,
-        h2_words_cute,
-        peer_ptrs_cute,
-        scatter_ptrs_cute,
-        tensormaps_cute,
-        padding_row.data_ptr(),
-        a_input.data_ptr(),
-        w.data_ptr(),
-        y.data_ptr(),
-        a_input.stride(0),
-        a_input.stride(1),
-        b_s0_val,
-        b_s1_val,
-        y.stride(0),
-        y.stride(1),
-        elem,
-        elem,
-        elem,
-        G,
-        kernel_M,
-        kernel_N,
-        kernel_K,
-        local_rank,
-        activation_buffer_base_ptr_i64,
-        cutlass.Int64(activation_buffer_size_bytes),
-        output_offsets_cute,
-        gathered_offsets_cute,
-        input_offsets_cute,
-        swiglu_output_offsets_cute,
-        use_activation_buffer,
-        cond_cute,
-        use_conditional_execution,
-        *swiglu_args,
-        swiglu_dz_offsets_cute,
-        swiglu_h1_offsets_cute,
-        num_clusters,
-        stream,
-        *secondary_compile_args,
-    )
-    # Runtime args: drop constexpr (elem_size_bytes_a/b/c, G,
-    # use_activation_buffer, use_conditional_execution) — baked into the
-    # compiled kernel.
+    # Launch args: torch tensors and ints, converted by TVM FFI in C++.
+    # Constexprs (element sizes, G, use_activation_buffer,
+    # use_conditional_execution) live in the binary; the stream is torch's
+    # current stream.
     runtime_args = (
-        a_cute,
-        b_cute,
-        c_cute,
-        split_cute,
-        counter_cute,
-        gather_counter_cute,
-        a_buff_counter_cute,
-        h2_words_cute,
-        peer_ptrs_cute,
-        scatter_ptrs_cute,
-        tensormaps_cute,
+        a_placeholder,
+        b_placeholder,
+        c_placeholder,
+        split_sizes,
+        counter,
+        gather_counter,
+        a_buff_counter,
+        h2_words,
+        peer_ptrs,
+        kernel_scatter_ptrs,
+        tensormaps,
         padding_row.data_ptr(),
         a_input.data_ptr(),
         w.data_ptr(),
@@ -1193,35 +1106,117 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
         kernel_K,
         local_rank,
         activation_buffer_base_ptr_i64,
-        cutlass.Int64(activation_buffer_size_bytes),
-        output_offsets_cute,
-        gathered_offsets_cute,
-        input_offsets_cute,
-        swiglu_output_offsets_cute,
-        cond_cute,
+        activation_buffer_size_bytes,
+        output_offset_for_kernel,
+        gathered_offset_for_kernel,
+        input_offset_for_kernel,
+        swiglu_output_offset_for_kernel,
+        cond_tensor,
         *swiglu_args,
-        swiglu_dz_offsets_cute,
-        swiglu_h1_offsets_cute,
+        swiglu_dz_offsets,
+        swiglu_h1_offsets,
         num_clusters,
-        stream,
         *secondary_runtime_args,
     )
-    prefix_target = (
-        DistGroupedGemmKernel.dispatch_kernel
-        if mode
-        in (
-            DistGroupedGemmKernel.DISPATCH,
-            DistGroupedGemmKernel.DISPATCH_SWIGLU_FWD,
+    compiled = _COMPILED_CACHE.get(cache_key)
+    if compiled is None:
+
+        def cute_tensor(tensor, assumed_align):
+            return from_dlpack(tensor, assumed_align=assumed_align, enable_tvm_ffi=True)
+
+        # TVM FFI raises when a tensor's shape differs from its compile-time
+        # shape. The cache key holds layouts, not sizes, so these are dynamic
+        # (the kernel reads only their base pointers):
+        #   a_buff_counter                  length follows kernel_M
+        #   peer_ptrs, kernel_scatter_ptrs  lengths follow the token count
+        #   tensormaps                      rows follow num_sms
+        compile_args = (
+            cute_tensor(a_placeholder, placeholder_align).mark_layout_dynamic(
+                leading_dim=1
+            ),
+            cute_tensor(
+                b_placeholder, _PYTORCH_ALLOCATOR_MIN_ALIGNMENT
+            ).mark_layout_dynamic(leading_dim=b_leading_dim),
+            cute_tensor(c_placeholder, placeholder_align).mark_layout_dynamic(
+                leading_dim=1
+            ),
+            # Tensors below are dtype-natural alignment for cute.arch.load:
+            # int32 → 4-byte, int64 → 8-byte. These are not subject to the
+            # buffer alignment contract because the kernel reads them as plain
+            # scalars, not as TMA-vectorized tiles.
+            cute_tensor(split_sizes, 4),
+            cute_tensor(counter, 4),
+            cute_tensor(gather_counter, 4),
+            cute_tensor(a_buff_counter, 4).mark_layout_dynamic(),
+            # Int64 row stride: the h2 store's Int32 row * (N // 4) can pass 2**31.
+            # Outside fused SwiGLU it is the 4-byte aligned counter stand-in.
+            cute_tensor(
+                h2_words, 16 if use_fused_swiglu_dispatch else 4
+            ).mark_layout_dynamic(leading_dim=1),
+            cute_tensor(peer_ptrs, 8).mark_layout_dynamic(),
+            cute_tensor(kernel_scatter_ptrs, 8).mark_layout_dynamic(),
+            cute_tensor(tensormaps, 8).mark_compact_shape_dynamic(mode=0),
+            padding_row.data_ptr(),
+            a_input.data_ptr(),
+            w.data_ptr(),
+            y.data_ptr(),
+            a_input.stride(0),
+            a_input.stride(1),
+            b_s0_val,
+            b_s1_val,
+            y.stride(0),
+            y.stride(1),
+            elem,
+            elem,
+            elem,
+            G,
+            kernel_M,
+            kernel_N,
+            kernel_K,
+            local_rank,
+            activation_buffer_base_ptr_i64,
+            activation_buffer_size_bytes,
+            # ALIGNMENT CONTRACT: the offset value (not the tensor) must come
+            # from the activation-buffer planner so that
+            # `activation_buffer.data_ptr() + offsets_ptr[0]` is
+            # `_ACTIVATION_BUFFER_ALIGNMENT`-aligned for downstream TMA. The
+            # offset tensor itself only carries 8-byte alignment.
+            cute_tensor(output_offset_for_kernel, 8),
+            cute_tensor(gathered_offset_for_kernel, 8),
+            cute_tensor(input_offset_for_kernel, 8),
+            cute_tensor(swiglu_output_offset_for_kernel, 8),
+            use_activation_buffer,
+            cute_tensor(cond_tensor, 4),
+            use_conditional_execution,
+            *swiglu_args,
+            cute_tensor(swiglu_dz_offsets, 8),
+            cute_tensor(swiglu_h1_offsets, 8),
+            num_clusters,
+            make_fake_stream(),
+            *(
+                cute_tensor(arg, 4).mark_layout_dynamic()
+                if isinstance(arg, torch.Tensor)
+                else arg
+                for arg in secondary_compile_args
+            ),
         )
-        else DistGroupedGemmKernel.combine_kernel
-    )
-    compiled = _compile_or_get(
-        cache_key,
-        kernel,
-        *compile_args,
-        name_prefix=name_prefix,
-        prefix_target=prefix_target,
-    )
+        prefix_target = (
+            DistGroupedGemmKernel.dispatch_kernel
+            if mode
+            in (
+                DistGroupedGemmKernel.DISPATCH,
+                DistGroupedGemmKernel.DISPATCH_SWIGLU_FWD,
+            )
+            else DistGroupedGemmKernel.combine_kernel
+        )
+        compiled = _compile_or_get(
+            cache_key,
+            kernel,
+            *compile_args,
+            name_prefix=name_prefix,
+            prefix_target=prefix_target,
+            options="--enable-tvm-ffi",
+        )
     compiled(*runtime_args)
     if use_activation_buffer and is_dispatch:
         # Public-API contract: when activation_buffer is provided in
