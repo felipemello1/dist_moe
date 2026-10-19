@@ -36,6 +36,7 @@ from .kernels.activation_buffer import (
     FORWARD_DISPATCH_OFFSET_BASE,
     MISSING_ACTIVATION_OFFSET,
 )
+from .kernels.pdl import pdl_wait_then_release
 
 # Memory alignment requirement in bytes for buffer sub-allocations
 MEMORY_ALIGNMENT = 128
@@ -1092,6 +1093,7 @@ def _triton_get_forward_plan(
     moe_layer_id_ptr,  # [N] int64 - IN-PLACE updated
     num_moe_layers: tl.constexpr,
     scratch_only: tl.constexpr,
+    PDL: tl.constexpr,
 ):
     """Triton kernel to compute forward plan without D2H transfers.
 
@@ -1113,6 +1115,7 @@ def _triton_get_forward_plan(
     peak_min_free_space_ptr are updated IN-PLACE, except under `scratch_only`,
     where only the scratch entry of peak_min_free_space_ptr is updated.
     """
+    pdl_wait_then_release(PDL)
     if num_recv_tokens_per_rank_snapshot_ptr is not None:
         rank_offsets = tl.arange(0, EP)
         rank_counts = tl.load(num_recv_tokens_per_rank_ptr + rank_offsets)

@@ -16,6 +16,7 @@ entry points, buffer bookkeeping, and validation live in
 import triton
 import triton.language as tl
 
+from ..pdl import pdl_wait_then_release
 from .comm_utils import (
     get_flat_tid,
     sync_threads,
@@ -81,7 +82,9 @@ def _triton_clear_decode_routing_state(
     counter_workspace_1_size,
     COPY_EXPERT_IDS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    PDL: tl.constexpr,
 ):
+    pdl_wait_then_release(PDL)
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     if COPY_EXPERT_IDS:
         token_offsets = offsets // topk
@@ -172,23 +175,22 @@ def _triton_decode_dispatch_routing(
     BLOCK_LOCAL_EXPERTS: tl.constexpr,
     BLOCK_WORLD_SIZE: tl.constexpr,
     NUM_CHUNKS: tl.constexpr,
+    PDL: tl.constexpr,
 ):
+    pdl_wait_then_release(PDL)
     # One CTA per (source rank, chunk of BLOCK_SLOTS route slots).
     pid = tl.program_id(0)
     source_rank = pid // NUM_CHUNKS
     chunk = pid % NUM_CHUNKS
-    _trap_if_peer_token_counts_differ(
-        routing_buffer_ptrs,
-        num_tokens,
-        world_size,
-        BLOCK_WORLD_SIZE,
-    )
     slot_offsets = chunk * BLOCK_SLOTS + tl.arange(0, BLOCK_SLOTS)
     valid_slots = slot_offsets < num_tokens * topk
 
-    routing_buffer_ptrs = routing_buffer_ptrs.to(tl.pointer_type(tl.uint64))
+    # Load the peer's IDs before the token-count check so the two peer reads overlap;
+    # the trap still precedes any use. This rank's count bounds the load and the
+    # routing buffers are symmetric, so a mismatched peer cannot fault it.
     routing_buffer_addr = (
-        tl.load(routing_buffer_ptrs + source_rank) + routing_header_size_bytes
+        tl.load(routing_buffer_ptrs.to(tl.pointer_type(tl.uint64)) + source_rank)
+        + routing_header_size_bytes
     )
     routing_buffer_ptr = routing_buffer_addr.to(tl.pointer_type(tl.int16))
     expert_ids = tl.load(
@@ -196,6 +198,12 @@ def _triton_decode_dispatch_routing(
         mask=valid_slots,
         other=-1,
     ).to(tl.int32)
+    _trap_if_peer_token_counts_differ(
+        routing_buffer_ptrs,
+        num_tokens,
+        world_size,
+        BLOCK_WORLD_SIZE,
+    )
     valid_experts = valid_slots & (expert_ids >= 0) & (expert_ids < num_experts)
     expert_slots = tl.atomic_add(
         expert_counters_ptr + expert_ids,

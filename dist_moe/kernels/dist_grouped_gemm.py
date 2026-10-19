@@ -99,6 +99,7 @@ from .grouped_gemm import (
 from .native_combine_swiglu import (
     native_swiglu_bwd_col_multiple,
 )
+from .pdl import pdl_enabled
 
 _PYTORCH_ALLOCATOR_MIN_ALIGNMENT: int = 16
 
@@ -234,6 +235,7 @@ def _get_dist_kernel(
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
     swiglu_emit_h2: bool = False,
     swiglu_emit_h1: bool = False,
+    use_pdl: bool = False,
 ) -> DistGroupedGemmKernel:
     """Return a cached kernel with the exact scheduling and SwiGLU controls."""
     swiglu_clamped, swiglu_alpha, swiglu_limit = canonical_swiglu_clamp(
@@ -258,6 +260,7 @@ def _get_dist_kernel(
         swiglu_limit,
         swiglu_emit_h2,
         swiglu_emit_h1,
+        use_pdl,
     )
     obj = _DIST_KERNEL_CACHE.get(key)
     if obj is None:
@@ -280,6 +283,7 @@ def _get_dist_kernel(
             swiglu_emit_h2=swiglu_emit_h2,
             swiglu_emit_h1=swiglu_emit_h1,
             gather_k_segments=gather_k_segments,
+            use_pdl=use_pdl,
         )
         _DIST_KERNEL_CACHE[key] = obj
     return obj
@@ -824,6 +828,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
             swiglu_limit=swiglu_limit,
             swiglu_emit_h2=swiglu_emit_h2,
             swiglu_emit_h1=swiglu_emit_h1,
+            use_pdl=pdl_enabled(),
         )
     else:
         kernel = kernel_override
@@ -1067,6 +1072,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
         kernel.swiglu_emit_h2,
         kernel.swiglu_emit_h1,
         kernel.GATHER_K_SEGMENTS,
+        kernel.use_pdl,
     )
     # Kernel-logical axes depend on problem_type:
     #   FPROP: out=N_w, in=K_w    → kernel (kernel_M, N_w, K_w)

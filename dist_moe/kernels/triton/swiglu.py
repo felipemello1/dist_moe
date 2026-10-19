@@ -51,6 +51,7 @@ from ...formats import (
     SWIGLU_CLAMP_LIMIT_DEFAULT,
 )
 from .._environment import is_blackwell_gpu, num_sms_per_device
+from ..pdl import pdl_launch_kwargs, pdl_wait_then_release
 from .fp_math import sigmoid
 from .repr_utils import make_dtype_repr
 
@@ -92,6 +93,7 @@ def _triton_swiglu_fwd(  # noqa: C901
     CLAMPED: tl.constexpr,
     ALPHA: tl.constexpr,
     LIMIT: tl.constexpr,
+    PDL: tl.constexpr,
 ):
     """Unified Triton kernel for SwiGLU forward pass with persistent kernel design.
 
@@ -106,6 +108,7 @@ def _triton_swiglu_fwd(  # noqa: C901
     When activation_buffer_ptr is not None, uses activation_buffer mode with pointer chasing.
     In activation_buffer mode, xy_offset_ptr and z_offset_ptr contain explicit byte offsets.
     """
+    pdl_wait_then_release(PDL)
     # Load conditional execution value (check happens after pointer setup)
     cond_val = 1  # Default: execute
     if conditional_execution_ptr is not None:
@@ -439,6 +442,7 @@ def swiglu_fwd(
             CLAMPED=clamped,
             ALPHA=alpha,
             LIMIT=limit,
+            **pdl_launch_kwargs(),
         )
 
         return z_offset
@@ -507,6 +511,7 @@ def swiglu_fwd(
             CLAMPED=clamped,
             ALPHA=alpha,
             LIMIT=limit,
+            **pdl_launch_kwargs(),
         )
 
         return z

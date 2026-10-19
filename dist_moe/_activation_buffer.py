@@ -77,6 +77,7 @@ from .kernels.activation_buffer import (
     GEMM_OPERAND_OFFSET_COUNT,
     MEGA_ACTIVATION_OFFSET_COUNT,
 )
+from .kernels.pdl import pdl_launch_kwargs
 
 logger = getLogger()
 
@@ -2447,6 +2448,7 @@ def get_forward_plan(
         moe_layer_id_ptr=buffer_status.moe_layer_id,
         num_moe_layers=_num_moe_layers_in_selected_slot,
         scratch_only=scratch_only,
+        **pdl_launch_kwargs(),
     )
 
     # Parse individual offsets from the tensor:

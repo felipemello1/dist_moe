@@ -2711,28 +2711,34 @@ def _dist_moe_custom_op_cuda(
         rmsnorm_use_kahan,
         rmsnorm_recompute_rstd,
     )
-    return _Bf16Autograd.forward(
-        kernel_ctx,
-        x_TD,
-        topk_expert_ids_TK,
-        topk_scores_TK,
-        w13_EFD,
-        w2_EDF,
-        activation_storage,
-        activation_slot_id_1,
-        num_moe_layers_in_slot,
-        routing_storage,
-        dispatch_storage,
-        combine_storage,
-        context_id,
-        ExecutionOptions(
-            experts_output_postprocess=postprocess,
-            swiglu_clip_stats_out_3=swiglu_clip_stats_out_3,
-            swiglu_clip_limit=swiglu_clip_limit,
-            validate_expert_ids=validate_expert_ids,
-        ),
-        False,
-    )
+    # Registered-op inference launches its kernel chain with PDL (kernels/pdl.py);
+    # inference with Python callbacks (requires_eager) does not. Imported here so
+    # `import dist_moe` does not import Triton.
+    from .kernels.pdl import pdl_launches
+
+    with pdl_launches(_get_context(context_id).config.inference):
+        return _Bf16Autograd.forward(
+            kernel_ctx,
+            x_TD,
+            topk_expert_ids_TK,
+            topk_scores_TK,
+            w13_EFD,
+            w2_EDF,
+            activation_storage,
+            activation_slot_id_1,
+            num_moe_layers_in_slot,
+            routing_storage,
+            dispatch_storage,
+            combine_storage,
+            context_id,
+            ExecutionOptions(
+                experts_output_postprocess=postprocess,
+                swiglu_clip_stats_out_3=swiglu_clip_stats_out_3,
+                swiglu_clip_limit=swiglu_clip_limit,
+                validate_expert_ids=validate_expert_ids,
+            ),
+            False,
+        )
 
 
 @torch.library.impl(_LIBRARY, "bf16", "Meta")

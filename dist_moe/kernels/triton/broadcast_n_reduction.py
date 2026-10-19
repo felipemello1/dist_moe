@@ -15,6 +15,7 @@ from .._environment import num_sms_per_device
 from ..activation_buffer import (
     validate_conditional_execution,
 )
+from ..pdl import pdl_launch_kwargs, pdl_wait_then_release
 from .repr_utils import make_dtype_repr
 
 SCALE_AND_SUM_TILE_D_MAX_TOKENS = 128
@@ -76,6 +77,7 @@ def scale_and_sum(
     x_copy_buffer: torch.Tensor | None = None,
     x_copy_offset: torch.Tensor | None = None,
     x_copy_condition: torch.Tensor | None = None,
+    select_routes: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Scale post combine tokens and sum them.
 
@@ -83,13 +85,16 @@ def scale_and_sum(
         x: Input tensor [T, K, D] - can be a buffer tensor
         scale: Scaling factors [T, K]
         expert_ids: Optional expert IDs. Negative routes are ignored without
-            reading their corresponding ``x`` storage.
+            reading their corresponding ``x`` storage, unless ``select_routes``.
         return_copy: If True, return a copy of x for backward. If False, return None.
         output_dtype: dtype for the output tensor y. If None, uses x.dtype.
         x_copy_buffer: Optional uint8 activation buffer receiving x when the
             device-side condition is zero.
         x_copy_offset: Byte offset of x in x_copy_buffer.
         x_copy_condition: Device-side bool or int32 recompute condition.
+        select_routes: Inference only, with ``expert_ids`` and no copy: load
+            route IDs, scores and rows together, then zero inactive routes,
+            instead of masking the score and row loads with the IDs.
 
     Returns:
         Tuple of (y, x_copy) where:
@@ -184,6 +189,11 @@ def scale_and_sum(
         X_DTYPE=_to_tl_dtype(x_dtype),
         BLOCK_K=triton.next_power_of_2(K),
         TILE_D=T <= SCALE_AND_SUM_TILE_D_MAX_TOKENS,
+        SELECT_ROUTES=select_routes
+        and expert_ids is not None
+        and not return_copy
+        and not copy_x_to_buffer,
+        **pdl_launch_kwargs(),
     )
     return y, x_copy
 
@@ -213,7 +223,10 @@ def _triton_scale_and_sum(  # noqa: C901
     X_DTYPE: tl.constexpr,
     BLOCK_K: tl.constexpr,
     TILE_D: tl.constexpr,
+    SELECT_ROUTES: tl.constexpr = False,
+    PDL: tl.constexpr = False,
 ) -> None:
+    pdl_wait_then_release(PDL)
     pid = tl.program_id(axis=0).to(tl.int64)
 
     if COPY_X_TO_BUFFER:
@@ -264,7 +277,8 @@ def _triton_scale_and_sum(  # noqa: C901
                     other=-1,
                 )
                 valid_routes = expert_ids >= 0
-                input_mask_tk &= valid_routes
+                if not SELECT_ROUTES:
+                    input_mask_tk &= valid_routes
 
             if scale_ptr is not None:
                 scale = tl.load(
@@ -284,6 +298,12 @@ def _triton_scale_and_sum(  # noqa: C901
                 other=0.0,
             )
             x = x_value.to(tl.float32)
+            if SELECT_ROUTES:
+                # The ID, score and row loads above issue together. An inactive
+                # route's row is unwritten combine storage and its score may be NaN:
+                # zero both so neither reaches the sum.
+                x = tl.where(valid_routes, x, 0.0)
+                scale = tl.where(valid_routes, scale, 0.0)
 
             if COPY_X_TO_BUFFER:
                 if copy_x_to_buffer:
