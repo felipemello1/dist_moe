@@ -8,15 +8,39 @@
 
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir.dialects import vector
+from cutlass.cutlass_dsl import dsl_user_op
 
+from ._quant_conversion import _cvt_bf16x2_to_f32x2, _cvt_f32x2_to_f16x2_rn
 from .dispatch_quant import _make_u32x4_vector_type
 
 
+@dsl_user_op
+def _add_bf16x8(vec, bias_vec, *, loc=None, ip=None):
+    """Return ``bf16(f32(vec) + f32(bias_vec))`` for 8 BF16 values packed as 4 x u32."""
+
+    def unpack(v, i):
+        word = vector.extract(v, dynamic_position=[], static_position=[i])
+        return _cvt_bf16x2_to_f32x2(cutlass.Uint32(word))
+
+    words = []
+    for i in range(4):
+        x_lo, x_hi = unpack(vec, i)
+        b_lo, b_hi = unpack(bias_vec, i)
+        word = _cvt_f32x2_to_f16x2_rn(x_lo + b_lo, x_hi + b_hi, cutlass.BFloat16)
+        words.append(word.ir_value(loc=loc, ip=ip))
+    return vector.from_elements(_make_u32x4_vector_type(), words, loc=loc, ip=ip)
+
+
 class CombineScatterMixin:
-    """Requires `has_padding_sentinels` and `EPILOG_WG_THREADS` on the kernel."""
+    """Requires `has_padding_sentinels` and `EPILOG_WG_THREADS` on the kernel.
+
+    A kernel with `has_bias` adds a BF16 bias row to every scattered row.
+    """
 
     has_padding_sentinels: bool
     EPILOG_WG_THREADS: int
+    has_bias: bool = False
 
     @cute.jit
     def _combine_epilog_load_scatter_ptrs(
@@ -92,10 +116,12 @@ class CombineScatterMixin:
         cluster_cta_rank: cutlass.Int32,
         ELEMS_PER_VEC: cutlass.Constexpr[int] = 8,
         subtile_axis_m: cutlass.Constexpr[bool] = False,
+        bias_row_addr_i64: cutlass.Int64 | None = None,
     ) -> None:
         """Scatter from the staged epilogue tile. Each lane stores one
         16-byte contiguous-N chunk; with 64-elem N subtiles, lanes 0..7
-        cover one row's chunks, 8..15 the next, etc."""
+        cover one row's chunks, 8..15 the next, etc. With `has_bias`, the
+        tile's expert bias row at `bias_row_addr_i64` is added first."""
         EPILOGUE_M: cutlass.Constexpr[int] = cute.size(sC.shape, mode=[0])
         EPILOGUE_N: cutlass.Constexpr[int] = cute.size(sC.shape, mode=[1])
         CHUNKS_PER_ROW: cutlass.Constexpr[int] = EPILOGUE_N // ELEMS_PER_VEC
@@ -153,6 +179,17 @@ class CombineScatterMixin:
                         _make_u32x4_vector_type(),
                         ss="cta",
                     )
+                    if cutlass.const_expr(self.has_bias):
+                        bias_addr = bias_row_addr_i64 + cutlass.Int64(
+                            n_global_first
+                        ) * cutlass.Int64(elem_size_bytes_c)
+                        bias_vec = cute.arch.load(
+                            cute.make_ptr(
+                                cutlass.Uint32, bias_addr, cute.AddressSpace.gmem
+                            ),
+                            _make_u32x4_vector_type(),
+                        )
+                        vec = _add_bf16x8(vec, bias_vec)
                     dst_addr = peer_base_i64 + cutlass.Int64(
                         n_global_first
                     ) * cutlass.Int64(elem_size_bytes_c)

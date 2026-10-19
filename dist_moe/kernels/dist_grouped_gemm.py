@@ -239,6 +239,7 @@ def _get_dist_kernel(
     use_pdl: bool = False,
     block_major_weights: bool = False,
     single_a_tensormap: bool = False,
+    has_bias: bool = False,
 ) -> DistGroupedGemmKernel:
     """Return a cached kernel with the exact scheduling and SwiGLU controls."""
     swiglu_clamped, swiglu_alpha, swiglu_limit = canonical_swiglu_clamp(
@@ -266,6 +267,7 @@ def _get_dist_kernel(
         use_pdl,
         block_major_weights,
         single_a_tensormap,
+        has_bias,
     )
     obj = _DIST_KERNEL_CACHE.get(key)
     if obj is None:
@@ -291,6 +293,7 @@ def _get_dist_kernel(
             use_pdl=use_pdl,
             block_major_weights=block_major_weights,
             single_a_tensormap=single_a_tensormap,
+            has_bias=has_bias,
         )
         _DIST_KERNEL_CACHE[key] = obj
     return obj
@@ -477,6 +480,8 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
     # FPROP: read A through one descriptor when the launch allows it (see
     # GroupedGemmKernel.SINGLE_A_TENSORMAP); otherwise per-group descriptors.
     single_a_tensormap: bool = False,
+    # COMBINE FPROP: contiguous BF16 [G, N] bias added to each scattered row.
+    bias: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused-kernel impl: launches DistGroupedGemmKernel directly.
 
@@ -861,6 +866,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
             use_pdl=pdl_enabled(),
             block_major_weights=block_major_weights,
             single_a_tensormap=single_a_tensormap,
+            has_bias=bias is not None,
         )
     else:
         kernel = kernel_override
@@ -1107,6 +1113,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
         kernel.use_pdl,
         kernel.block_major_weights,
         kernel.SINGLE_A_TENSORMAP,
+        kernel.has_bias,
     )
     # Kernel-logical axes depend on problem_type:
     #   FPROP: out=N_w, in=K_w    → kernel (kernel_M, N_w, K_w)
@@ -1117,6 +1124,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
     else:  # _DGRAD
         kernel_N = int(K)
         kernel_K = int(N)
+    bias_ptr = 0 if bias is None else bias.data_ptr()
     compile_args = (
         a_cute,
         b_cute,
@@ -1130,6 +1138,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
         scatter_ptrs_cute,
         tensormaps_cute,
         padding_row.data_ptr(),
+        bias_ptr,
         a_input.data_ptr(),
         w.data_ptr(),
         y.data_ptr(),
@@ -1179,6 +1188,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
         scatter_ptrs_cute,
         tensormaps_cute,
         padding_row.data_ptr(),
+        bias_ptr,
         a_input.data_ptr(),
         w.data_ptr(),
         y.data_ptr(),
@@ -1621,6 +1631,7 @@ def dist_grouped_gemm_fprop_combine(
     pre_shuffled_rows: bool = False,
     block_major_weights: bool = False,
     single_a_tensormap: bool = False,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Distributed grouped GEMM forward combine: fused GEMM + scatter.
 
@@ -1635,8 +1646,19 @@ def dist_grouped_gemm_fprop_combine(
     `precleared_counter_storage` and `block_major_weights` follow the dispatch
     launch's contract.
 
+    `bias` is an optional contiguous ``[G, N]`` tensor in `w`'s dtype; row
+    ``g`` is added to expert ``g``'s outputs before the scatter.
+
     The caller owns all peer synchronization.
     """
+    if bias is not None and (
+        bias.shape != w.shape[:2]
+        or bias.dtype != torch.bfloat16
+        or w.dtype != torch.bfloat16
+        or not bias.is_contiguous()
+        or bias.device != w.device
+    ):
+        raise ValueError("bias must be a contiguous BF16 [G, N] tensor matching w")
     if scatter_ptrs.dtype != torch.int64:
         raise TypeError("scatter_ptrs must be int64")
     if not scatter_ptrs.is_cuda or scatter_ptrs.device != x.device:
@@ -1668,6 +1690,7 @@ def dist_grouped_gemm_fprop_combine(
         m_multiple_of=m_multiple_of,
         block_major_weights=block_major_weights,
         single_a_tensormap=single_a_tensormap,
+        bias=bias,
     )
     return symm_mem_buffer.local()
 

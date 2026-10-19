@@ -399,7 +399,7 @@ class Config:
             tokens per GPU); with D 2048 it is even or ahead except at 512-1024
             tokens per GPU, where a layer is 4-12 us (4-7%) slower. Requires
             ``block_major_weights`` (only ``relayout_to_block_major``
-            interleaves); no clip statistics.
+            interleaves); no W13 bias or clip statistics.
     """
 
     max_num_local_input_tokens: int
@@ -1866,6 +1866,55 @@ def _validate_inputs(  # noqa: C901
         raise ValueError("all operation tensors must be contiguous")
 
 
+def _validate_projection_biases(
+    options: ExecutionOptions,
+    w13_EFD: torch.Tensor,
+    w2_EDF: torch.Tensor,
+    context: Context,
+) -> None:
+    """Validate the optional W13/W2 projection biases against their weights.
+
+    Args:
+        options: Per-call options holding ``w13_bias_EF`` and ``w2_bias_ED``.
+        w13_EFD: Local gate/up weights; the W13 bias has ``w13_EFD.shape[:2]``.
+        w2_EDF: Local down weights; the W2 bias has ``w2_EDF.shape[:2]``.
+        context: Execution context; biases need a BF16 inference context.
+
+    Raises:
+        ValueError: If a bias is used outside BF16 inference, a W13 bias with
+            ``interleaved_gate_up``, or a bias is not a contiguous
+            16-byte-aligned tensor with its weight's leading shape, dtype and
+            device.
+    """
+    if options.w13_bias_EF is None and options.w2_bias_ED is None:
+        return
+    # TODO: block-scaled support: add W2 in the shared combine scatter epilogue
+    # and W13 in the fused SwiGLU-quantize kernel.
+    if not context.config.inference or context.config.block_scaled is not None:
+        raise ValueError("projection biases are supported only by BF16 inference")
+    # The dispatch epilogue that computes interleaved W13's SwiGLU adds no bias.
+    if options.w13_bias_EF is not None and context.config.interleaved_gate_up:
+        raise ValueError("w13_bias_EF is not supported with interleaved_gate_up")
+    for name, weight in (("w13_bias_EF", w13_EFD), ("w2_bias_ED", w2_EDF)):
+        bias = getattr(options, name)
+        if bias is None:
+            continue
+        shape = tuple(weight.shape[:2])
+        # The combine epilogue reads the W2 bias in 16-byte vectors.
+        if (
+            not isinstance(bias, torch.Tensor)
+            or tuple(bias.shape) != shape
+            or bias.dtype != weight.dtype
+            or bias.device != weight.device
+            or not bias.is_contiguous()
+            or bias.data_ptr() % 16
+        ):
+            raise ValueError(
+                f"{name} must be a contiguous 16-byte-aligned {list(shape)} tensor "
+                "with the weight's dtype and device"
+            )
+
+
 def _ep_barrier(
     buffer: Any,
     conditional_execution: torch.Tensor | None = None,
@@ -2116,6 +2165,7 @@ class _Bf16Autograd(torch.autograd.Function):
         fused_swiglu_forward = (
             options.swiglu_clip_stats_out_3 is None
             and not config.block_major_weights
+            and options.w13_bias_EF is None
             and fprop_config is not None
             and _native_swiglu_fwd_config_is_compatible(fprop_config, w2_EDF.shape[2])
         )
@@ -2166,8 +2216,8 @@ class _Bf16Autograd(torch.autograd.Function):
                 block_major_weights=config.block_major_weights,
                 single_a_tensormap=config.inference,
             )
-            # Clip observation, block-major weights without interleaved_gate_up
-            # and unsupported explicit presets retain the standalone
+            # Clip observation, block-major weights without interleaved_gate_up,
+            # a W13 bias and unsupported explicit presets retain the standalone
             # activation; eligible dispatch emits H2 (and H1 unless W13 is
             # interleaved).
             if not dispatch_writes_h2:
@@ -2191,6 +2241,8 @@ class _Bf16Autograd(torch.autograd.Function):
                     clip_stats_out=options.swiglu_clip_stats_out_3,
                     clip_limit=options.swiglu_clip_limit,
                     max_rows=max_recv_rows,
+                    bias=options.w13_bias_EF,
+                    num_tokens_per_local_expert=routing.num_tokens_per_local_experts,
                 )
             h3_MD = dist_grouped_gemm_fprop_combine(
                 x=forward_plan.h2_offset,
@@ -2205,6 +2257,7 @@ class _Bf16Autograd(torch.autograd.Function):
                 precleared_counter_storage=combine_counter_storage,
                 block_major_weights=config.block_major_weights,
                 single_a_tensormap=config.inference,
+                bias=options.w2_bias_ED,
             )
             h3_MD = h3_MD.view(-1, context.hidden_dim)[
                 : num_local_input_tokens * context.top_k
@@ -2701,6 +2754,7 @@ class _Bf16Autograd(torch.autograd.Function):
 _LIBRARY = torch.library.Library("dist_moe", "DEF")
 _LIBRARY.define(
     "bf16(Tensor x_TD, Tensor topk_expert_ids_TK, Tensor topk_scores_TK, Tensor w13_EFD, Tensor w2_EDF, "
+    "Tensor? w13_bias_EF, Tensor? w2_bias_ED, "
     "Tensor? rmsnorm_weight_D, bool rmsnorm_enabled, float rmsnorm_eps, "
     "ScalarType rmsnorm_norm_output_dtype, ScalarType rmsnorm_output_dtype, "
     "bool rmsnorm_require_bitwise, float rmsnorm_gain_center, bool rmsnorm_use_kahan, bool rmsnorm_recompute_rstd, "
@@ -2720,6 +2774,8 @@ def _dist_moe_custom_op_cuda(
     topk_scores_TK: torch.Tensor,
     w13_EFD: torch.Tensor,
     w2_EDF: torch.Tensor,
+    w13_bias_EF: torch.Tensor | None,
+    w2_bias_ED: torch.Tensor | None,
     rmsnorm_weight_D: torch.Tensor | None,
     rmsnorm_enabled: bool,
     rmsnorm_eps: float,
@@ -2748,6 +2804,8 @@ def _dist_moe_custom_op_cuda(
         topk_scores_TK: Precomputed expert weights.
         w13_EFD: Local gate/up-projection weights.
         w2_EDF: Local down-projection weights.
+        w13_bias_EF: Optional local gate/up bias.
+        w2_bias_ED: Optional local down-projection bias.
         rmsnorm_weight_D: Optional inference-only input-scale gamma.
         rmsnorm_enabled: Whether to run fused post-expert RMSNorm.
         rmsnorm_eps: RMSNorm epsilon.
@@ -2808,6 +2866,8 @@ def _dist_moe_custom_op_cuda(
                 swiglu_clip_stats_out_3=swiglu_clip_stats_out_3,
                 swiglu_clip_limit=swiglu_clip_limit,
                 validate_expert_ids=validate_expert_ids,
+                w13_bias_EF=w13_bias_EF,
+                w2_bias_ED=w2_bias_ED,
             ),
             False,
         )
@@ -2820,6 +2880,8 @@ def _dist_moe_custom_op_meta(
     topk_scores_TK: torch.Tensor,
     w13_EFD: torch.Tensor,
     w2_EDF: torch.Tensor,
+    w13_bias_EF: torch.Tensor | None,
+    w2_bias_ED: torch.Tensor | None,
     rmsnorm_weight_D: torch.Tensor | None,
     rmsnorm_enabled: bool,
     rmsnorm_eps: float,
@@ -2848,6 +2910,8 @@ def _dist_moe_custom_op_meta(
         topk_scores_TK: Expert scores, unused for metadata propagation.
         w13_EFD: Gate/up weights, unused for metadata propagation.
         w2_EDF: Down weights, unused for metadata propagation.
+        w13_bias_EF: Gate/up bias, unused for metadata propagation.
+        w2_bias_ED: Down bias, unused for metadata propagation.
         rmsnorm_weight_D: Optional input scale, unused for metadata propagation.
         rmsnorm_enabled: RMSNorm selection, unused for metadata propagation.
         rmsnorm_eps: RMSNorm epsilon, unused for metadata propagation.
@@ -2871,7 +2935,7 @@ def _dist_moe_custom_op_meta(
         Empty tensor with the output shape, dtype, and device metadata.
     """
     del topk_expert_ids_TK, topk_scores_TK, w13_EFD
-    del w2_EDF, rmsnorm_weight_D, rmsnorm_enabled
+    del w2_EDF, w13_bias_EF, w2_bias_ED, rmsnorm_weight_D, rmsnorm_enabled
     del rmsnorm_eps, rmsnorm_norm_output_dtype, rmsnorm_output_dtype
     del rmsnorm_require_bitwise, rmsnorm_gain_center, rmsnorm_use_kahan
     del rmsnorm_recompute_rstd, activation_storage, activation_slot_id_1
@@ -4071,6 +4135,7 @@ def routed_experts(  # noqa: C901
             w2_EDF,
             context,
         )
+    _validate_projection_biases(options, w13_EFD, w2_EDF, context)
     postprocess = options.experts_output_postprocess
     rmsnorm_weight_D = (
         postprocess.weight if isinstance(postprocess, RMSNormPostprocess) else None
@@ -4083,6 +4148,8 @@ def routed_experts(  # noqa: C901
             w13_EFD,
             w2_EDF,
             rmsnorm_weight_D,
+            options.w13_bias_EF,
+            options.w2_bias_ED,
         )
     ):
         raise RuntimeError("inference contexts do not support autograd")
@@ -4191,6 +4258,8 @@ def routed_experts(  # noqa: C901
         topk_scores_TK,
         w13_EFD,
         w2_EDF,
+        options.w13_bias_EF,
+        options.w2_bias_ED,
         *rmsnorm_args,
         activation_buffer.buffer,
         activation_buffer.activation_slot_id_1,

@@ -141,6 +141,12 @@ class ExecutionOptions:
             before Python postprocess and observer callbacks. This is required
             when callbacks coexist with ``-1`` routes unless the caller
             otherwise guarantees callback-safe storage.
+        w13_bias_EF: Optional gate/up bias ``[E_local, 2F]``; row ``e`` is
+            ``[gate (F) | up (F)]``, like ``w13_EFD[e]``.
+        w2_bias_ED: Optional down-projection bias ``[E_local, D]``. Both
+            biases: BF16 inference only (no training, no block-scaled
+            experts). Each is added in fp32 and rounded to BF16, like a BF16
+            ``projection + bias``.
     """
 
     inplace_wgrad_accum: bool = False
@@ -157,6 +163,8 @@ class ExecutionOptions:
     wgrad_destination_fn: WgradDestinationFn | None = None
     validate_expert_ids: bool = False
     zero_out_padded_callback_inputs: bool = False
+    w13_bias_EF: torch.Tensor | None = None
+    w2_bias_ED: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         """Validate graph-visible observability and WGRAD controls.
