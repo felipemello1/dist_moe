@@ -2257,6 +2257,7 @@ class DistMoeKernelTest(unittest.TestCase):
         inference: bool = True,
         block_scaled: dist_moe.BlockScaledConfig | None = None,
         num_tokens: int = 8,
+        hidden_dim: int = 256,
     ) -> tuple:
         """Create two input sets and one standalone DistMoE context.
 
@@ -2271,6 +2272,7 @@ class DistMoeKernelTest(unittest.TestCase):
             inference: Whether to create a scratch-only inference context.
             block_scaled: Optional block-scaled execution policy.
             num_tokens: Tokens per input set (and the context's capacity).
+            hidden_dim: Model hidden size.
 
         Returns:
             dist_moe.Context, two ``(x, topk_ids, topk_scores)`` tuples, and the two
@@ -2284,7 +2286,7 @@ class DistMoeKernelTest(unittest.TestCase):
                 world_size=1,
             )
         torch.manual_seed(43)
-        hidden_dim, intermediate_dim = 256, 256
+        intermediate_dim = 256
         ids_a = (
             torch.arange(num_tokens, device="cuda")[:, None] * top_k
             + torch.arange(top_k, device="cuda")[None, :]
@@ -2598,6 +2600,41 @@ class DistMoeKernelTest(unittest.TestCase):
         x_TD, _, topk_scores_TK = case_a
         used = torch.tensor([0, 5, 6, 40, 63], device="cuda")
         topk_expert_ids_TK = used[(torch.arange(40)[:, None] + torch.arange(2)) % 5]
+        weights = (
+            dist_moe.prepare_block_scaled_weight(
+                w13_EFD, policy, inference=True, fuse_swiglu=True
+            ),
+            dist_moe.prepare_block_scaled_weight(w2_EDF, policy, inference=True),
+        )
+        with torch.no_grad():
+            actual_TD = dist_moe.routed_experts(
+                x_TD, topk_expert_ids_TK, topk_scores_TK, *weights, context
+            )
+        expected_TD = _reference_moe(
+            x_TD, topk_expert_ids_TK, topk_scores_TK, w13_EFD, w2_EDF
+        )
+        _rtol, _atol, relative_l2, cosine = _blockscaled_tolerance(policy.format, "fwd")
+        self.assertLess(_relative_l2(actual_TD, expected_TD), relative_l2)
+        self.assertGreater(_cosine_similarity(actual_TD, expected_TD), cosine)
+
+    def test_mxfp8_mega_decode_gather_places_row_scales(self) -> None:
+        """Mega's decode gather puts every row's scale bytes in the right place.
+
+        40 tokens over 64 experts, so most 32-row gather blocks are padding;
+        hidden_dim 2048 gives 64 scale columns per row, so several work items and
+        16-byte scale loads per row. Each (token, 32-column block) gets a power of
+        two that repeats every 7 blocks, so a scale byte in the wrong row, or 8 or
+        16 columns off, moves its block by at least 2x. Within MXFP8 tolerance of
+        the dense reference.
+        """
+        policy = dist_moe.BlockScaledConfig(pipeline="mega")
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+            num_experts=64, num_tokens=40, hidden_dim=2048, block_scaled=policy
+        )
+        x_TD, topk_expert_ids_TK, topk_scores_TK = case_a
+        block_D = torch.arange(x_TD.shape[1], device="cuda") // 32
+        token_T1 = torch.arange(x_TD.shape[0], device="cuda")[:, None]
+        x_TD = x_TD * torch.exp2(((block_D + token_T1) % 7 - 3).float()).to(x_TD.dtype)
         weights = (
             dist_moe.prepare_block_scaled_weight(
                 w13_EFD, policy, inference=True, fuse_swiglu=True
