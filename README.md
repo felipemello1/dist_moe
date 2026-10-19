@@ -667,7 +667,7 @@ See [the BF16 kernel design](docs/bf16_kernel_design.md#block-major-weights).
 
 W13 can also interleave its gate and up rows so the dispatch GEMM writes the
 SwiGLU output itself. Set the flag and the interleave together: the flag is not
-checked against the weights. No clip statistics; see
+checked against the weights. No W13 bias or clip statistics; see
 `Config.interleaved_gate_up` for where it loses. Example:
 
 ```python
@@ -677,6 +677,20 @@ config = dataclasses.replace(
     config, block_major_weights=True, interleaved_gate_up=True
 )
 ```
+
+### Expert projection biases
+
+BF16 inference can add a per-expert bias after the gate/up and the down
+projections, as GPT-OSS-style experts do:
+
+```python
+options = dist_moe.ExecutionOptions(
+    w13_bias_EF=w13_bias_EF,  # [E_local, 2F] = [gate | up], weight dtype
+    w2_bias_ED=w2_bias_ED,  # [E_local, D]
+)
+```
+
+A W13 bias runs the standalone SwiGLU instead of the fused dispatch epilogue.
 
 ### Clip statistics
 

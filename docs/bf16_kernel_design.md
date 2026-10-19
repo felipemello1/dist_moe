@@ -181,7 +181,7 @@ of 16 (`relayout_to_block_major(w13, interleave_gate_up=True)`), so a C staging
 tile already holds each gate column next to its up column. The dispatch
 epilogue then writes only `h2`, swapped or not: no `h1` store and no standalone
 SwiGLU. Each group of 16 gate/up values is split over two threads, one batched
-sigmoid of 8 values each. It adds no clip counters; see
+sigmoid of 8 values each. It adds no W13 bias and no clip counters; see
 `Config.interleaved_gate_up` for where it loses.
 
 Forward fusion does not extend H2's lifetime. The planner always places it in
