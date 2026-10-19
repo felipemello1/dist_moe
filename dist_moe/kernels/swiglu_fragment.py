@@ -197,7 +197,15 @@ def store_swiglu_h2_fragment(
             cute.make_layout(group),
         )
         out = cute.make_rmem_tensor(group // 2, cutlass.Uint32)
-        _swiglu_words(words, out, swiglu, tRS_rC.element_type)
+        _swiglu_words(
+            words,
+            out,
+            swiglu.fast_math,
+            swiglu.clamped,
+            swiglu.alpha,
+            swiglu.limit,
+            tRS_rC.element_type,
+        )
         if row_in_group < m_size:
             for chunk in cutlass.range_constexpr(2):
                 _copy_store_u32_words(
@@ -345,7 +353,15 @@ def _swiglu_h2_row_subtile(
                 chunk,
             )
     out = cute.make_rmem_tensor(group // 2, cutlass.Uint32)
-    _swiglu_words(words, out, swiglu, dtype)
+    _swiglu_words(
+        words,
+        out,
+        swiglu.fast_math,
+        swiglu.clamped,
+        swiglu.alpha,
+        swiglu.limit,
+        dtype,
+    )
     if row_valid:
         for c in cutlass.range_constexpr(2):
             _copy_store_u32_words(
@@ -362,20 +378,21 @@ def _swiglu_h2_row_subtile(
 def _swiglu_words(
     words: cute.Tensor,
     out: cute.Tensor,
-    swiglu: SwigluH2Epilogue,
+    fast_math: cutlass.Constexpr[bool],
+    clamped: cutlass.Constexpr[bool],
+    alpha: cutlass.Constexpr[float],
+    limit: cutlass.Constexpr[float],
     dtype: cutlass.Constexpr,
 ) -> None:
     """SwiGLU of `[gate | up]` b16x2 `words` into `out`."""
     half: cutlass.Constexpr[int] = cute.size(out)
-    if cutlass.const_expr(swiglu.fast_math or swiglu.clamped):
+    if cutlass.const_expr(fast_math or clamped):
         for pair in cutlass.range_constexpr(half):
             gate = _cvt_f16x2_to_f32x2(words[pair], dtype)
             up = _cvt_f16x2_to_f32x2(words[pair + half], dtype)
-            if cutlass.const_expr(swiglu.clamped):
+            if cutlass.const_expr(clamped):
                 result = tuple(
-                    _swiglu_clamped_fwd_f32(
-                        gate[i], up[i], swiglu.alpha, swiglu.limit, swiglu.fast_math
-                    )
+                    _swiglu_clamped_fwd_f32(gate[i], up[i], alpha, limit, fast_math)
                     for i in range(2)
                 )
             else:

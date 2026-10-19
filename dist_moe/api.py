@@ -71,6 +71,7 @@ from .formats import (
     SWIGLU_CLAMP_ALPHA_DEFAULT,
     SWIGLU_CLAMP_LIMIT_DEFAULT,
 )
+from .kernels._grouped_gemm_config import NATIVE_SWIZZLE_GROUP_SIZE
 
 if TYPE_CHECKING:
     from ._activation_buffer import (
@@ -389,6 +390,16 @@ class Config:
             faster. BF16 inference only (training backward reads row-major
             weights); ``intermediate_dim`` must be a multiple of 64. Weight
             callbacks receive the stored block-major tensors.
+        interleaved_gate_up: Whether every W13 was rewritten by
+            ``relayout_to_block_major(w13, interleave_gate_up=True)``; set
+            both or neither, since the weights are not checked. The dispatch
+            GEMM then writes the SwiGLU output itself, with no separate SwiGLU
+            kernel. Above 256 rows per local expert it keeps 256-row tiles. At
+            EP 4 it wins at every measured size with D 4096-7168 (64-8192
+            tokens per GPU); with D 2048 it is even or ahead except at 512-1024
+            tokens per GPU, where a layer is 4-12 us (4-7%) slower. Requires
+            ``block_major_weights`` (only ``relayout_to_block_major``
+            interleaves); no clip statistics.
     """
 
     max_num_local_input_tokens: int
@@ -411,6 +422,7 @@ class Config:
     wgrad_dtype: torch.dtype | None = None
     inference: bool = False
     block_major_weights: bool = False
+    interleaved_gate_up: bool = False
 
     def __post_init__(self) -> None:  # noqa: C901
         """Validate static execution parameters.
@@ -497,6 +509,8 @@ class Config:
                 "block_major_weights requires BF16 inference and an "
                 "intermediate_dim that is a multiple of 64"
             )
+        if self.interleaved_gate_up and not self.block_major_weights:
+            raise ValueError("interleaved_gate_up requires block_major_weights")
         if (
             self.bf16_grouped_gemm_preset is not None
             and self.bf16_grouped_gemm_preset not in _BF16_GROUPED_GEMM_CONFIGS
@@ -2105,6 +2119,12 @@ class _Bf16Autograd(torch.autograd.Function):
             and fprop_config is not None
             and _native_swiglu_fwd_config_is_compatible(fprop_config, w2_EDF.shape[2])
         )
+        # Interleaved W13 has no natural h1 for the standalone SwiGLU to read.
+        if config.interleaved_gate_up and options.swiglu_clip_stats_out_3 is not None:
+            raise ValueError(
+                "SwiGLU clip stats are not supported with interleaved_gate_up"
+            )
+        dispatch_writes_h2 = fused_swiglu_forward or config.interleaved_gate_up
 
         # 3. Retain the local input only when backward may need device-selected
         # recomputation; all other intermediates follow the planner offsets.
@@ -2137,7 +2157,8 @@ class _Bf16Autograd(torch.autograd.Function):
                 x_gathered=forward_plan.x_gathered_offset,
                 config=fprop_config,
                 estimate_recv_num_tokens=estimated_num_recv_rows,
-                swiglu_h2=forward_plan.h2_offset if fused_swiglu_forward else None,
+                swiglu_h2=forward_plan.h2_offset if dispatch_writes_h2 else None,
+                interleaved_gate_up=config.interleaved_gate_up,
                 swiglu_clamped=config.activation == "swiglu_clamped",
                 swiglu_alpha=config.swiglu_alpha,
                 swiglu_limit=config.swiglu_limit,
@@ -2145,10 +2166,11 @@ class _Bf16Autograd(torch.autograd.Function):
                 block_major_weights=config.block_major_weights,
                 single_a_tensormap=config.inference,
             )
-            # Clip observation, block-major weights and unsupported explicit
-            # presets retain the standalone activation; eligible dispatch emits
-            # both H1 and H2.
-            if not fused_swiglu_forward:
+            # Clip observation, block-major weights without interleaved_gate_up
+            # and unsupported explicit presets retain the standalone
+            # activation; eligible dispatch emits H2 (and H1 unless W13 is
+            # interleaved).
+            if not dispatch_writes_h2:
                 # A token picks each expert at most once, so every peer sends at
                 # most min(top_k, local experts) routes per token.
                 max_recv_rows = (
@@ -4183,7 +4205,9 @@ def routed_experts(  # noqa: C901
     )
 
 
-def relayout_to_block_major(weight: torch.Tensor) -> None:
+def relayout_to_block_major(
+    weight: torch.Tensor, *, interleave_gate_up: bool = False
+) -> None:
     """Rewrite each expert's ``[N, K]`` weight in place as ``[K / 64, N, 64]``.
 
     This is the layout a context with ``Config.block_major_weights`` reads.
@@ -4193,30 +4217,45 @@ def relayout_to_block_major(weight: torch.Tensor) -> None:
         row-major:    r0[0:64] r0[64:128] r1[0:64] r1[64:128] ...
         block-major:  r0[0:64] r1[0:64] ... r(N-1)[0:64] r0[64:128] r1[64:128] ...
 
+    With ``interleave_gate_up`` (W13 for ``Config.interleaved_gate_up``), the
+    rows are first reordered in gate/up groups of 16::
+
+        natural:      g0..g(F-1) u0..u(F-1)
+        interleaved:  g0..g15 u0..u15 g16..g31 u16..u31 ...
+
     Args:
         weight: Contiguous expert weight ``[E, N, K]``: ``[E, 2F, D]`` for W13,
             ``[E, D, F]`` for W2. K must be a multiple of 64.
+        interleave_gate_up: Interleave W13's gate and up rows; N must be a
+            multiple of 32.
 
     Raises:
         ValueError: If ``weight`` is not a contiguous 3-D tensor with K a
             multiple of 64.
     """
+    group = NATIVE_SWIZZLE_GROUP_SIZE
     if (
         weight.ndim != 3
         or not weight.is_contiguous()
         or weight.shape[2] % BLOCK_MAJOR_K != 0
+        or (interleave_gate_up and weight.shape[1] % (2 * group) != 0)
     ):
         raise ValueError(
             "relayout_to_block_major needs a contiguous [E, N, K] weight whose K "
-            "is a multiple of 64"
+            f"is a multiple of 64 (and N of {2 * group} with interleave_gate_up)"
         )
     num_rows, k = weight.shape[1:]
-    # One expert at a time: the temp is one [N, K] weight, not a second copy.
+    # One expert at a time: the temp is one [N, K] weight (two when
+    # interleaving), not a second copy.
     block_BN64 = weight.new_empty(k // BLOCK_MAJOR_K, num_rows, BLOCK_MAJOR_K)
     with torch.inference_mode():
         for weight_NK in weight:
+            rows_NK = weight_NK
+            if interleave_gate_up:
+                rows_NK = weight_NK.view(2, -1, group, k).transpose(0, 1)
+                rows_NK = rows_NK.reshape(num_rows, k)
             block_BN64.copy_(
-                weight_NK.view(num_rows, k // BLOCK_MAJOR_K, BLOCK_MAJOR_K).transpose(
+                rows_NK.view(num_rows, k // BLOCK_MAJOR_K, BLOCK_MAJOR_K).transpose(
                     0, 1
                 )
             )

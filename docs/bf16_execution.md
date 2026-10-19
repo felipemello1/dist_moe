@@ -226,6 +226,9 @@ interleaved TMA view to bring each gate/up pair into one epilogue subtile;
 it does not allocate or retain a second weight or activation layout. Both
 `h1` and `h2` are written to the existing planner destinations. Their
 `int64[1]` byte offsets are read on device, not copied to the host.
+Inference with `Config.interleaved_gate_up` is the exception: W13 itself is
+interleaved, only `h2` is written, and any config fuses, swapped included (see
+[interleaved W13](bf16_kernel_design.md#interleaved-w13)).
 
 Forward fusion is selected only when clip counters are absent and the
 resolved preset passes the native geometry check: `F` is divisible by 32,

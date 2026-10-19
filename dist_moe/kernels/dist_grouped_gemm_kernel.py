@@ -770,6 +770,9 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                                             epilogue_threads=_DIST_EPILOG_WG_THREADS,
                                             fast_math=self.swiglu_fast_math,
                                             swizzle_group_size=NATIVE_SWIZZLE_GROUP_SIZE,
+                                            clamped=self.swiglu_clamped,
+                                            alpha=self.swiglu_alpha,
+                                            limit=self.swiglu_limit,
                                         )
                                     else:
                                         self._combine_epilog_scatter_smem_tile(

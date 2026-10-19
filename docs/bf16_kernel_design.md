@@ -81,8 +81,8 @@ block-major:  r0[0:64] r1[0:64] ... r(N-1)[0:64] r0[64:128] r1[64:128] ...
 The FPROP dispatch and combine kernels view the weight operand (B, or A when
 swapped) as `(N, (64, K/64), G) : (64, (1, 64N), NK)`; the TMA atom and
 partitions are unchanged. Only BF16 inference supports it: DGRAD and WGRAD
-read the weights row-major, and the fused SwiGLU dispatch epilogue is not used
-with it.
+read the weights row-major, and the fused SwiGLU dispatch epilogue runs with it
+only for [interleaved W13](#interleaved-w13).
 
 <a id="cta-roles"></a>
 ## CTA roles
@@ -172,6 +172,17 @@ it only for a resolved compatible preset and without clip counters. Otherwise
 the Triton `swiglu_fwd` operates on the same H1/H2 offsets. Clip observation
 resets and accumulates its FP32 `[3]` counters in that standalone variant;
 it is not a capability of the native epilogue.
+
+<a id="interleaved-w13"></a>
+### Interleaved W13 (inference)
+
+With `Config.interleaved_gate_up`, W13 itself stores gate and up rows in groups
+of 16 (`relayout_to_block_major(w13, interleave_gate_up=True)`), so a C staging
+tile already holds each gate column next to its up column. The dispatch
+epilogue then writes only `h2`, swapped or not: no `h1` store and no standalone
+SwiGLU. Each group of 16 gate/up values is split over two threads, one batched
+sigmoid of 8 values each. It adds no clip counters; see
+`Config.interleaved_gate_up` for where it loses.
 
 Forward fusion does not extend H2's lifetime. The planner always places it in
 shared scratch, while H1 may be saved in an activation slot. Backward therefore

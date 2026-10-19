@@ -40,6 +40,7 @@ from .grouped_gemm_kernel import (
 from .params import (
     DispatchQuantSync,
 )
+from .swiglu_fragment import _SIGMOID_BATCH, _swiglu_words
 from .tile_scheduler import blockscaled_scale_row_start
 
 # Staged uses two lanes per MX scale block; Mega keeps the lower-pressure fragment.
@@ -193,12 +194,29 @@ def store_interleaved_swiglu_smem_tile(
         )
     groups_per_row: cutlass.Constexpr[int] = epi_n // (2 * swizzle_group_size)
     total_groups: cutlass.Constexpr[int] = epi_m * groups_per_row
+    # Each group of 16 gate/up values goes to 2 threads, 8 values each, so a
+    # thread runs one batched sigmoid of 8 (default variant) instead of 16
+    # sigmoids in sequence. It pays most at 32 rows per expert.
+    # Block-scaled callers (groups of 8) keep 1 thread per group. The batched
+    # sigmoid votes across the warp, so it needs whole warps.
+    items_per_group: cutlass.Constexpr[int] = (
+        2
+        if swizzle_group_size == 2 * _SIGMOID_BATCH
+        and (2 * total_groups) % 32 == 0
+        and epilogue_threads % 32 == 0
+        else 1
+    )
+    total_items: cutlass.Constexpr[int] = total_groups * items_per_group
+    chunk_words: cutlass.Constexpr[int] = _SIGMOID_BATCH // 2
     passes: cutlass.Constexpr[int] = (
-        total_groups + epilogue_threads - 1
+        total_items + epilogue_threads - 1
     ) // epilogue_threads
     for work_pass in cutlass.range_constexpr(passes):
-        group_linear = tidx + cutlass.Int32(work_pass * epilogue_threads)
-        if group_linear < cutlass.Int32(total_groups):
+        item = tidx + cutlass.Int32(work_pass * epilogue_threads)
+        if item < cutlass.Int32(total_items):
+            group_linear = item
+            if cutlass.const_expr(items_per_group == 2):
+                group_linear = item // cutlass.Int32(2)
             local_row, local_group, row_in_group, input_col = (
                 _interleaved_swiglu_tile_coordinates(
                     group_linear,
@@ -221,9 +239,48 @@ def store_interleaved_swiglu_smem_tile(
                     swizzle_group_size,
                 )
             )
-            if (row_in_group < m_size) and (
+            stored = (row_in_group < m_size) and (
                 input_col + cutlass.Int32(2 * swizzle_group_size) <= n_size
-            ):
+            )
+            if cutlass.const_expr(items_per_group == 2):
+                # This thread's 8 gate and 8 up values as `[gate | up]` b16x2
+                # words; rows not stored compute on zeros (no slow sigmoid path).
+                chunk_idx = item % cutlass.Int32(2)
+                gate_col = local_group * cutlass.Int32(
+                    2 * swizzle_group_size
+                ) + chunk_idx * cutlass.Int32(_SIGMOID_BATCH)
+                words = cute.make_rmem_tensor((chunk_words, 2), cutlass.Int32)
+                words.fill(0)
+                if stored:
+                    for half in cutlass.range_constexpr(2):
+                        _load_tensor_row_as_b16x2(
+                            sC_stage,
+                            local_row,
+                            gate_col + cutlass.Int32(half * swizzle_group_size),
+                            words[None, half],
+                            _SIGMOID_BATCH,
+                            sC_stage.element_type,
+                        )
+                batch_words = cute.make_rmem_tensor(chunk_words, cutlass.Uint32)
+                _swiglu_words(
+                    words,
+                    batch_words,
+                    fast_math,
+                    clamped,
+                    alpha,
+                    limit,
+                    sC_stage.element_type,
+                )
+                if stored:
+                    _copy_store_u32_words(
+                        m_output_words,
+                        cutlass.Int64(cm_start + row_in_group),
+                        input_col // cutlass.Int32(4)
+                        + chunk_idx * cutlass.Int32(chunk_words),
+                        batch_words,
+                        chunk_words,
+                    )
+            elif stored:
                 vals = _load_interleaved_swiglu_values(
                     sC_stage,
                     local_row,

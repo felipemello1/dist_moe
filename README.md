@@ -665,6 +665,19 @@ config = dataclasses.replace(config, block_major_weights=True)
 
 See [the BF16 kernel design](docs/bf16_kernel_design.md#block-major-weights).
 
+W13 can also interleave its gate and up rows so the dispatch GEMM writes the
+SwiGLU output itself. Set the flag and the interleave together: the flag is not
+checked against the weights. No clip statistics; see
+`Config.interleaved_gate_up` for where it loses. Example:
+
+```python
+dist_moe.relayout_to_block_major(w13_EFD, interleave_gate_up=True)
+dist_moe.relayout_to_block_major(w2_EDF)
+config = dataclasses.replace(
+    config, block_major_weights=True, interleaved_gate_up=True
+)
+```
+
 ### Clip statistics
 
 BF16 execution can rewrite caller-owned SwiGLU counters on every forward. The

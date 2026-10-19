@@ -754,9 +754,14 @@ def derive_auto_grouped_gemm_fprop_config(
             _align_up(busiest_rows, _NATIVE_FPROP_BLOCK_M_GRANULARITY),
         )
     else:
+        # A SwiGLU-writing epilogue (epilogue_tile_n_multiple) is slow, so it
+        # needs a second TMEM accumulator to overlap the next tile's MMAs.
+        # 2cta2mma_bm512_bn256 fills TMEM with one, so these epilogues stay on
+        # 256-row tiles.
         block_m = (
             _NATIVE_FPROP_MIDDLE_BLOCK_M
             if block_m <= _NATIVE_FPROP_MIDDLE_BLOCK_M
+            or epilogue_tile_n_multiple is not None
             else 512
         )
     num_ctas = 1 if block_m <= _NATIVE_FPROP_MAX_1CTA_BLOCK_M else 2

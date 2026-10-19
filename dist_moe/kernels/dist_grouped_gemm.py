@@ -1265,6 +1265,7 @@ def dist_grouped_gemm_fprop_dispatch(
     swiglu_limit: float = SWIGLU_CLAMP_LIMIT_DEFAULT,
     block_major_weights: bool = False,
     single_a_tensormap: bool = False,
+    interleaved_gate_up: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Distributed grouped GEMM fprop dispatch: gather A from peers, GEMM.
 
@@ -1297,7 +1298,8 @@ def dist_grouped_gemm_fprop_dispatch(
     the launch then skips its own memset.
 
     `block_major_weights` reads weights rewritten by `relayout_to_block_major`
-    (`Config.block_major_weights`).
+    (`Config.block_major_weights`). With `interleaved_gate_up` (W13 rows in
+    gate/up groups of 16), `swiglu_h2` is written and y is not.
 
     Returns: (y_out, x_out), or the original (y_offset, x_gathered_offset)
     tensors when activation_buffer is provided.
@@ -1333,7 +1335,7 @@ def dist_grouped_gemm_fprop_dispatch(
         precleared_counter_storage=precleared_counter_storage,
         m_multiple_of=m_multiple_of,
         swiglu_output=swiglu_h2,
-        swiglu_emit_h1=emit_swiglu,
+        swiglu_emit_h1=emit_swiglu and not interleaved_gate_up,
         swiglu_fast_math=emit_swiglu and swiglu_fast_math,
         swiglu_clamped=emit_swiglu and swiglu_clamped,
         swiglu_alpha=swiglu_alpha,

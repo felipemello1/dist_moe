@@ -658,6 +658,36 @@ class DistMoeConfigTest(unittest.TestCase):
                     block_m,
                 )
 
+    def test_bf16_inference_fused_swiglu_dispatch_keeps_two_accumulators(
+        self,
+    ) -> None:
+        """Above 256 rows per expert, the SwiGLU-writing dispatch keeps 2 TMEM buffers.
+
+        Plain FPROP still resolves the 512-row tile, whose single accumulator
+        would make the next tile's MMAs wait for the slow SwiGLU epilogue.
+        """
+        multiple = dist_grouped_gemm_impl.NATIVE_SWIGLU_EPILOGUE_TILE_N_MULTIPLE
+        for rows_per_expert in (257, 512, 1024):
+            for epilogue_tile_n_multiple, expected in (
+                (None, {"BLOCK_SIZE_M": 512, "NUM_TMEM_BUFFERS": 1}),
+                (multiple, {"NUM_TMEM_BUFFERS": 2}),
+            ):
+                with self.subTest(
+                    rows_per_expert=rows_per_expert,
+                    epilogue_tile_n_multiple=epilogue_tile_n_multiple,
+                ):
+                    name = dist_grouped_gemm_impl._resolve_dist_grouped_gemm_config(
+                        config=None,
+                        kernel_M=rows_per_expert * 64,
+                        G=64,
+                        problem_type=grouped_gemm_impl._FPROP,
+                        N=8192,
+                        num_sms=148,
+                        epilogue_tile_n_multiple=epilogue_tile_n_multiple,
+                    )
+                    config = grouped_gemm_config_impl.GROUPED_GEMM_CONFIGS[name]
+                    self.assertEqual({key: config[key] for key in expected}, expected)
+
     def test_wide_tmem_load_workaround_targets_blackwell(self) -> None:
         """Apply the TMEM-load cap to both Blackwell targets and nothing else."""
         check = grouped_gemm_kernel_impl._tmem_ld_wide_fragment_nvvm_broken
@@ -853,6 +883,11 @@ class DistMoeConfigTest(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "block_major_weights"),
             ):
                 dist_moe.Config(**{**base, **overrides})
+        with self.assertRaisesRegex(ValueError, "interleaved_gate_up"):
+            dist_moe.Config(
+                **{**base, **inference, "block_major_weights": False},
+                interleaved_gate_up=True,
+            )
 
     def test_mxfp8_weight_preparation_supports_fake_tensor_tracing(self) -> None:
         """Fake preparation preserves exact packed shapes and backward ownership.
@@ -2190,6 +2225,7 @@ class DistMoeKernelTest(unittest.TestCase):
         swiglu_limit: float = 7.0,
         inference: bool = True,
         block_scaled: dist_moe.BlockScaledConfig | None = None,
+        num_tokens: int = 8,
     ) -> tuple:
         """Create two input sets and one standalone DistMoE context.
 
@@ -2203,6 +2239,7 @@ class DistMoeKernelTest(unittest.TestCase):
             swiglu_limit: Preactivation bound for clamped SwiGLU.
             inference: Whether to create a scratch-only inference context.
             block_scaled: Optional block-scaled execution policy.
+            num_tokens: Tokens per input set (and the context's capacity).
 
         Returns:
             dist_moe.Context, two ``(x, topk_ids, topk_scores)`` tuples, and the two
@@ -2216,7 +2253,7 @@ class DistMoeKernelTest(unittest.TestCase):
                 world_size=1,
             )
         torch.manual_seed(43)
-        num_tokens, hidden_dim, intermediate_dim = 8, 256, 256
+        hidden_dim, intermediate_dim = 256, 256
         ids_a = (
             torch.arange(num_tokens, device="cuda")[:, None] * top_k
             + torch.arange(top_k, device="cuda")[None, :]
@@ -4548,6 +4585,52 @@ class DistMoeKernelTest(unittest.TestCase):
                 for block_major in (False, True)
             },
         )
+
+    def test_bf16_inference_interleaved_gate_up_matches_row_major(self) -> None:
+        """The dispatch-epilogue SwiGLU of interleaved W13 is bitwise exact.
+
+        Row-major weights with the standalone SwiGLU vs block-major weights with
+        W13 gate/up rows interleaved (``Config.interleaved_gate_up``). Cases:
+        swapped decode tiles (auto config), clamped SwiGLU, a 128-row preset and
+        a 2-CTA preset (2-CTA tiles are auto at 2048+ tokens per GPU) with 300
+        rows per expert, so CTA rank 1 and MMA atom 1 store rows too.
+        """
+        for activation, preset, num_tokens in (
+            ("swiglu", None, 8),
+            ("swiglu_clamped", None, 8),
+            ("swiglu", "1cta1mma_bm128_bn128", 8),
+            ("swiglu", "2cta2mma_bm512_bn256", 600),
+        ):
+            with self.subTest(activation=activation, preset=preset):
+                context, (x, ids, scores), _, w13, w2 = self._create_case(
+                    activation=activation, num_tokens=num_tokens
+                )
+                config = dataclasses.replace(
+                    context.config, bf16_grouped_gemm_preset=preset
+                )
+                row_context = dist_moe.create_context(
+                    group=dist.group.WORLD, config=config
+                )
+                fused_context = dist_moe.create_context(
+                    group=dist.group.WORLD,
+                    config=dataclasses.replace(
+                        config, block_major_weights=True, interleaved_gate_up=True
+                    ),
+                )
+                fused_w13, fused_w2 = w13.clone(), w2.clone()
+                dist_moe.relayout_to_block_major(fused_w13, interleave_gate_up=True)
+                dist_moe.relayout_to_block_major(fused_w2)
+                with torch.inference_mode():
+                    row_major_TD = dist_moe.routed_experts(
+                        x, ids, scores, w13, w2, row_context
+                    )
+                    fused_TD = dist_moe.routed_experts(
+                        x, ids, scores, fused_w13, fused_w2, fused_context
+                    )
+                context.close()
+                row_context.close()
+                fused_context.close()
+                torch.testing.assert_close(fused_TD, row_major_TD, rtol=0, atol=0)
 
     def test_two_saved_layers_match_reference_without_recompute(self) -> None:
         """Each layer retains its own post-combine state for score gradients."""
