@@ -1197,6 +1197,37 @@ class DistMoeConfigTest(unittest.TestCase):
                 self.assertIsNotNone(device_plan.inference_operand_bytes)
                 self.assertGreater(device_plan.inference_operand_bytes, 0)
 
+    def test_static_mega_counters_lead_every_layout(self) -> None:
+        """Routing zeroes the counters view before Mega picks its token tile.
+
+        For 32-, 64-compact- and 256-row tiles, `counters` starts at byte 0 with the
+        view's size. CPU check; `bind()` needs CUDA.
+        """
+        from dist_moe.kernels.blockscaled_config import MXFP8_E4M3, NVFP4
+        from dist_moe.kernels.chunked_mega_blockscaled_grouped_gemm import (
+            _chunked_mega_operand_layout,
+            _static_counters_view,
+        )
+
+        storage = torch.empty(1 << 20, dtype=torch.uint8)
+        cases = ((32, False), (64, True), (256, False))
+        for fmt, (block_n, compact) in (
+            (f, c) for f in (MXFP8_E4M3, NVFP4) for c in cases
+        ):
+            with self.subTest(format=fmt, block_n=block_n, compact=compact):
+                shape = {"rows": 1024, "groups": 8, "hidden_dim": 256, "format": fmt}
+                view = _static_counters_view(storage, **shape)
+                layout = _chunked_mega_operand_layout(
+                    **shape,
+                    intermediate_dim=256,
+                    config={"BLOCK_SIZE_N": block_n, "COMPACT_DECODE_ROWS": compact},
+                    num_sms=148,
+                    interleaved_fc13=True,
+                )
+                counters = next(r for r in layout.regions if r.name == "counters")
+                self.assertEqual(counters.offset_bytes, 0)
+                self.assertEqual(counters.shape, (view.numel(),))
+
     def test_callback_options_require_eager_execution(self) -> None:
         """Only Python-owned execution controls leave the custom-op path."""
         registered_options = dist_moe.ExecutionOptions()
