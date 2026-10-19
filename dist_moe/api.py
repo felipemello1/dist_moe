@@ -4206,13 +4206,16 @@ def routed_experts(  # noqa: C901
 
 
 def relayout_to_block_major(
-    weight: torch.Tensor, *, interleave_gate_up: bool = False
+    weight: torch.Tensor,
+    *,
+    interleave_gate_up: bool = False,
+    out: torch.Tensor | None = None,
 ) -> None:
-    """Rewrite each expert's ``[N, K]`` weight in place as ``[K / 64, N, 64]``.
+    """Rewrite each expert's ``[N, K]`` weight as ``[K / 64, N, 64]``.
 
     This is the layout a context with ``Config.block_major_weights`` reads.
-    The shape is unchanged, so afterwards only Dist-MoE may read the weight, and
-    a second call permutes it again. With ``K = 128``::
+    The shape is unchanged, so afterwards only Dist-MoE may read the rewritten
+    tensor, and a second in-place call permutes it again. With ``K = 128``::
 
         row-major:    r0[0:64] r0[64:128] r1[0:64] r1[64:128] ...
         block-major:  r0[0:64] r1[0:64] ... r(N-1)[0:64] r0[64:128] r1[64:128] ...
@@ -4228,10 +4231,19 @@ def relayout_to_block_major(
             ``[E, D, F]`` for W2. K must be a multiple of 64.
         interleave_gate_up: Interleave W13's gate and up rows; N must be a
             multiple of 32.
+        out: Where to write the rewritten copy, leaving ``weight`` unchanged: a
+            contiguous tensor with ``weight``'s shape, dtype and device. ``None``
+            rewrites ``weight`` in place, one expert at a time.
+
+    Example::
+
+        relayout_to_block_major(w13_EFD)                    # in place
+        relayout_to_block_major(gathered_EFD, out=w13_EFD)  # gathered_EFD unchanged
 
     Raises:
         ValueError: If ``weight`` is not a contiguous 3-D tensor with K a
-            multiple of 64.
+            multiple of 64, or ``out`` is not a contiguous tensor with its
+            shape, dtype and device.
     """
     group = NATIVE_SWIZZLE_GROUP_SIZE
     if (
@@ -4244,22 +4256,36 @@ def relayout_to_block_major(
             "relayout_to_block_major needs a contiguous [E, N, K] weight whose K "
             f"is a multiple of 64 (and N of {2 * group} with interleave_gate_up)"
         )
-    num_rows, k = weight.shape[1:]
-    # One expert at a time: the temp is one [N, K] weight (two when
-    # interleaving), not a second copy.
-    block_BN64 = weight.new_empty(k // BLOCK_MAJOR_K, num_rows, BLOCK_MAJOR_K)
+    if out is not None and (
+        out.shape != weight.shape
+        or out.dtype != weight.dtype
+        or out.device != weight.device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "relayout_to_block_major's out must be a contiguous tensor with the "
+            "weight's shape, dtype and device"
+        )
+    num_experts, num_rows, k = weight.shape
+    # View each expert's [N, K] as [half, group, row, K / 64, 64] and permute it to
+    # [K / 64, group, half, row, 64]: block-major, gate/up groups interleaved.
+    # Without interleave_gate_up, half and group have size 1 (rows stay in order).
+    halves, group_rows = (2, group) if interleave_gate_up else (1, num_rows)
+    num_groups = num_rows // (halves * group_rows)
+    num_blocks = k // BLOCK_MAJOR_K
+    block_shape = (num_blocks, num_groups, halves, group_rows, BLOCK_MAJOR_K)
     with torch.inference_mode():
-        for weight_NK in weight:
-            rows_NK = weight_NK
-            if interleave_gate_up:
-                rows_NK = weight_NK.view(2, -1, group, k).transpose(0, 1)
-                rows_NK = rows_NK.reshape(num_rows, k)
-            block_BN64.copy_(
-                rows_NK.view(num_rows, k // BLOCK_MAJOR_K, BLOCK_MAJOR_K).transpose(
-                    0, 1
-                )
-            )
-            weight_NK.view(block_BN64.shape).copy_(block_BN64)
+        block_major = weight.view(
+            num_experts, halves, num_groups, group_rows, num_blocks, BLOCK_MAJOR_K
+        ).permute(0, 4, 2, 1, 3, 5)
+        if out is not None:
+            out.view(num_experts, *block_shape).copy_(block_major)
+            return
+        # One expert at a time: the temp is one [N, K] weight, not a second copy.
+        block = weight.new_empty(block_shape)
+        for expert, weight_NK in enumerate(weight):
+            block.copy_(block_major[expert])
+            weight_NK.view(block_shape).copy_(block)
 
 
 def prepare_block_scaled_weight(
