@@ -16,8 +16,8 @@ parameters (the ``swiglu_epilogue.py`` convention).
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import llvm, vector
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 from ..formats import (
     CUBLAS_BLOCKED_ENTRIES_PER_ROW_LANE,
@@ -124,6 +124,40 @@ def _wait_lane_counters_at_least(
 def _make_u32x4_vector_type():
     """MLIR ir.VectorType<4xi32> for 16-byte vectorized load/store."""
     return ir.VectorType.get([4], cutlass.Uint32.mlir_type)
+
+
+@dsl_user_op
+def _load_u32x4_or_zero(
+    addr: cutlass.Int64, pred: cutlass.Boolean, *, loc=None, ip=None
+) -> ir.Value:
+    """16-byte ``ld.global.cg`` when ``pred``, else zeros and no load.
+
+    ``cute.arch.load`` takes no predicate; this is CUTLASS ``arch::global_load``.
+    Issue a batch of these before any store so their round trips overlap.
+    """
+    words = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32, i32, i32, i32)>"),
+        [
+            cutlass.Int64(addr).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(pred).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred p;\n"
+        "setp.ne.b32 p, $5, 0;\n"
+        "mov.b32 $0, 0;\n"
+        "mov.b32 $1, 0;\n"
+        "mov.b32 $2, 0;\n"
+        "mov.b32 $3, 0;\n"
+        "@p ld.global.cg.v4.u32 {$0, $1, $2, $3}, [$4]; }",
+        "=r,=r,=r,=r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+    )
+    return vector.from_elements(
+        _make_u32x4_vector_type(),
+        [llvm.extractvalue(T.i32(), words, [i], loc=loc, ip=ip) for i in range(4)],
+        loc=loc,
+        ip=ip,
+    )
 
 
 @cute.jit
@@ -315,6 +349,44 @@ def _dispatch_copy_blockscaled_work_tile(  # noqa: C901
     qdata_row_bytes = q_word_cols * cutlass.Int32(4)
     qword_vecs_per_work_tile: cutlass.Constexpr[int] = q_words_per_work_tile // 4
     qword_vec_count: cutlass.Constexpr[int] = sf_vec_size * qword_vecs_per_work_tile
+    # MXFP8 rows: padded rows (null gather pointer) load zeros inside the batch,
+    # so the qdata loads stay in flight, and each row's scales come in 16-byte
+    # loads issued before the qdata. NVFP4 and MXFP4 keep the old copy (not timed).
+    is_mxfp8: cutlass.Constexpr[bool] = (
+        sf_vec_size == 32 and DISPATCH_QUANT_QDATA_ELEMS_PER_WORD == 4
+    )
+    scale_cols_per_load: cutlass.Constexpr[int] = 16  # 1-byte scales, 16-byte load
+    scale_loads_per_row: cutlass.Constexpr[int] = (
+        scale_cols_per_work_tile // scale_cols_per_load
+    )
+    load_row_scales: cutlass.Constexpr[bool] = (
+        is_mxfp8
+        and scale_cols_per_work_tile % scale_cols_per_load == 0
+        and sf_vec_size * scale_loads_per_row <= group_threads
+    )
+    if cutlass.const_expr(load_row_scales):
+        is_scale_lane = group_lane < cutlass.Int32(sf_vec_size * scale_loads_per_row)
+        scale_row = group_lane // cutlass.Int32(scale_loads_per_row)
+        scale_load_col = scale_col_start + (
+            group_lane - scale_row * cutlass.Int32(scale_loads_per_row)
+        ) * cutlass.Int32(scale_cols_per_load)
+        scale_row_addr = cutlass.Int64(0)
+        if is_scale_lane:
+            scale_row_addr = cute.arch.load(
+                gather_ptrs + scale_row,
+                cutlass.Int64,
+                ss="cta",
+            )
+        # Rows, K and `scale_col_start` are multiples of 16 bytes, so a load that
+        # starts in the scales stays in the row. K % 128 (checked for every inference
+        # dispatch in `_blockscaled_dispatch_stride_bytes`) makes the 4-byte stores
+        # whole 4-column atoms.
+        scale_words = _load_u32x4_or_zero(
+            scale_row_addr
+            + cutlass.Int64(qdata_row_bytes)
+            + cutlass.Int64(scale_load_col),
+            scale_row_addr != cutlass.Int64(0) and scale_load_col < scale_cols,
+        )
     # Static q-word row stride: an Int32 row would wrap row * q_word_cols past 2**31.
     mRowQWords = cute.domain_offset((cutlass.Int64(row_start), 0), mRowQWords)
     for linear_qword_vec_base in cutlass.range(
@@ -386,6 +458,21 @@ def _dispatch_copy_blockscaled_work_tile(  # noqa: C901
                     output_ptrs[prefetch_idx],
                     values[prefetch_idx],
                 )
+        elif cutlass.const_expr(is_mxfp8):
+            # Same bytes as below: data where valid, zeros on padded rows.
+            values: list = []
+            for prefetch_idx in cutlass.range_constexpr(qdata_prefetch):
+                values.append(
+                    _load_u32x4_or_zero(
+                        source_ptrs[prefetch_idx].toint(), input_valid[prefetch_idx]
+                    )
+                )
+            for prefetch_idx in cutlass.range_constexpr(qdata_prefetch):
+                if (
+                    linear_valids[prefetch_idx]
+                    and qword_cols[prefetch_idx] < q_word_cols
+                ):
+                    cute.arch.store(output_ptrs[prefetch_idx], values[prefetch_idx])
         else:
             for prefetch_idx in cutlass.range_constexpr(qdata_prefetch):
                 qword_col = qword_cols[prefetch_idx]
@@ -404,55 +491,80 @@ def _dispatch_copy_blockscaled_work_tile(  # noqa: C901
                             qword_col + cutlass.Int32(value_idx),
                         ] = cutlass.Uint32(0)
 
-    vector_scale_copy: cutlass.Constexpr[bool] = VECTOR_DISPATCH_SCALE_COPY
-    scale_cols_per_copy: cutlass.Constexpr[int] = (
-        CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM if vector_scale_copy else 1
-    )
-    scale_value_dtype = cutlass.Uint32 if vector_scale_copy else cutlass.Uint8
-    assert DISPATCH_QUANT_SCALE_COLS_PER_TILE % scale_cols_per_copy == 0
-    assert scale_cols_per_work_tile % scale_cols_per_copy == 0
-    scale_copies_per_work_tile: cutlass.Constexpr[int] = (
-        scale_cols_per_work_tile // scale_cols_per_copy
-    )
-    scale_copies: cutlass.Constexpr[int] = sf_vec_size * scale_copies_per_work_tile
-    for linear_scale_copy in cutlass.range(
-        group_lane,
-        cutlass.Int32(scale_copies),
-        cutlass.Int32(group_threads),
-        unroll=1,
-    ):
-        local_row = linear_scale_copy // cutlass.Int32(scale_copies_per_work_tile)
-        local_scale_copy = linear_scale_copy - local_row * cutlass.Int32(
-            scale_copies_per_work_tile
+    if cutlass.const_expr(load_row_scales):
+        if is_scale_lane:
+            for word in cutlass.range_constexpr(
+                scale_cols_per_load // CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM
+            ):
+                scale_col = scale_load_col + cutlass.Int32(
+                    word * CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM
+                )
+                if scale_col < scale_cols:
+                    scale_offset = _cublas_blockscaled_qscale_offset(
+                        row_scale_start + scale_row,
+                        scale_col,
+                        scale_col_blocks,
+                    )
+                    scale_ptr = cute.recast_ptr(
+                        mRowScale.iterator + scale_offset,
+                        dtype=cutlass.Uint32,
+                    )
+                    scale_word = vector.extract(
+                        scale_words, dynamic_position=[], static_position=[word]
+                    )
+                    cute.arch.store(scale_ptr, cutlass.Uint32(scale_word))
+    else:
+        vector_scale_copy: cutlass.Constexpr[bool] = VECTOR_DISPATCH_SCALE_COPY
+        scale_cols_per_copy: cutlass.Constexpr[int] = (
+            CUBLAS_BLOCKED_SCALE_COLS_PER_ATOM if vector_scale_copy else 1
         )
-        scale_col = scale_col_start + local_scale_copy * cutlass.Int32(
-            scale_cols_per_copy
+        scale_value_dtype = cutlass.Uint32 if vector_scale_copy else cutlass.Uint8
+        assert DISPATCH_QUANT_SCALE_COLS_PER_TILE % scale_cols_per_copy == 0
+        assert scale_cols_per_work_tile % scale_cols_per_copy == 0
+        scale_copies_per_work_tile: cutlass.Constexpr[int] = (
+            scale_cols_per_work_tile // scale_cols_per_copy
         )
-        value = scale_value_dtype(0)
-        row_addr = cute.arch.load(
-            gather_ptrs + local_row,
-            cutlass.Int64,
-            ss="cta",
-        )
-        if row_addr != cutlass.Int64(0) and scale_col < scale_cols:
-            source = cute.make_ptr(
-                scale_value_dtype,
-                row_addr + cutlass.Int64(qdata_row_bytes) + cutlass.Int64(scale_col),
-                cute.AddressSpace.gmem,
-                assumed_align=scale_cols_per_copy,
+        scale_copies: cutlass.Constexpr[int] = sf_vec_size * scale_copies_per_work_tile
+        for linear_scale_copy in cutlass.range(
+            group_lane,
+            cutlass.Int32(scale_copies),
+            cutlass.Int32(group_threads),
+            unroll=1,
+        ):
+            local_row = linear_scale_copy // cutlass.Int32(scale_copies_per_work_tile)
+            local_scale_copy = linear_scale_copy - local_row * cutlass.Int32(
+                scale_copies_per_work_tile
             )
-            value = cute.arch.load(source, scale_value_dtype)
-        if scale_col < scale_cols:
-            scale_offset = _cublas_blockscaled_qscale_offset(
-                row_scale_start + local_row,
-                scale_col,
-                scale_col_blocks,
+            scale_col = scale_col_start + local_scale_copy * cutlass.Int32(
+                scale_cols_per_copy
             )
-            scale_ptr = cute.recast_ptr(
-                mRowScale.iterator + scale_offset,
-                dtype=scale_value_dtype,
+            value = scale_value_dtype(0)
+            row_addr = cute.arch.load(
+                gather_ptrs + local_row,
+                cutlass.Int64,
+                ss="cta",
             )
-            cute.arch.store(scale_ptr, value)
+            if row_addr != cutlass.Int64(0) and scale_col < scale_cols:
+                source = cute.make_ptr(
+                    scale_value_dtype,
+                    row_addr
+                    + cutlass.Int64(qdata_row_bytes)
+                    + cutlass.Int64(scale_col),
+                    cute.AddressSpace.gmem,
+                    assumed_align=scale_cols_per_copy,
+                )
+                value = cute.arch.load(source, scale_value_dtype)
+            if scale_col < scale_cols:
+                scale_offset = _cublas_blockscaled_qscale_offset(
+                    row_scale_start + local_row,
+                    scale_col,
+                    scale_col_blocks,
+                )
+                scale_ptr = cute.recast_ptr(
+                    mRowScale.iterator + scale_offset,
+                    dtype=scale_value_dtype,
+                )
+                cute.arch.store(scale_ptr, value)
     if cutlass.const_expr(use_global_scale_inv):
         if scale_col_start == 0 and group_lane < cutlass.Int32(sf_vec_size):
             value = cutlass.Float32(1.0)

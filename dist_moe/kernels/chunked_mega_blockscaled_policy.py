@@ -93,6 +93,9 @@ def _use_vector_dispatch_scale_copy(
     # strips (D=4096) square MXFP4 at 65,536 tokens/rank measures 13,824 -> 14,093
     # us vectorized, while 384-byte strips (D=12288) keep large vectorized
     # wins through 64K tokens (contraction A8W4 at 32,768: 28,333 -> 22,909 us).
+    # MXFP8 rows ignore this flag: they always copy scales in 16-byte row loads
+    # (`_dispatch_copy_blockscaled_work_tile`); for them it only picks the narrow
+    # decode work item.
     if format is NVFP4:
         return (hidden_dim, intermediate_dim) == (12288, 3072) and not wide_gather
     if not _dispatch_scale_copy_atom_aligned(format=format, hidden_dim=hidden_dim):
