@@ -1168,7 +1168,7 @@ class ChunkedMegaProblemVisitor:
             self.group_idx = Int32(self.G)
 
     @cute.jit
-    def _seek_valid_slot(self) -> None:  # noqa: C901
+    def _seek_valid_slot(self, tile_idx: Int32) -> None:  # noqa: C901
         if cutlass.const_expr(self.GLOBAL_LEAD_CHUNKS > 0):
             self._seek_valid_slot_global()
             return
@@ -1181,6 +1181,12 @@ class ChunkedMegaProblemVisitor:
                 num_slots += Int32(self.LEAD_CHUNKS)
             if self.lead_chunk_idx >= num_slots:
                 self._advance_group()
+                # Rows on N (SWAP_MN) and one N cluster make a group's tiles
+                # m_tiles x ceil(rows / BLOCK_SIZE_N), the count the skip sums.
+                if cutlass.const_expr(
+                    self.STAGE_ALL_FC13 and self.SWAP_MN and self.NUM_N_CLUSTERS == 1
+                ):
+                    self._skip_whole_groups(tile_idx)
             else:
                 linear_chunk_idx = self.lead_chunk_idx
                 if cutlass.const_expr(not self.STAGE_ALL_FC13):
@@ -1288,6 +1294,56 @@ class ChunkedMegaProblemVisitor:
                     self._advance_slot()
 
     @cute.jit
+    def _skip_whole_groups(self, tile_idx: Int32) -> None:
+        """Jump over the groups that end at or before `tile_idx`, 32 per warp step.
+
+        Leaves `group_idx`, `tile_start` and the four prefixes where stepping slot by
+        slot would. Never skips the problem's last group, so `_advance_group` still
+        switches FC13 to FC2. Call at a group start; every lane must call it.
+        """
+        lane = cute.arch.lane_idx()
+        m_tiles = (Int32(2) * self.N + Int32(self.BLOCK_SIZE_M - 1)) // Int32(
+            self.BLOCK_SIZE_M
+        )
+        if self.problem_idx == Int32(1):
+            fc2_block_m: cutlass.Constexpr[int] = (
+                self.BLOCK_SIZE_M * self.FC2_TILES_PER_ITEM
+            )
+            m_tiles = (self.K + Int32(fc2_block_m - 1)) // Int32(fc2_block_m)
+        more = cutlass.Boolean(True)
+        while more:
+            group = self.group_idx + lane
+            in_problem = group < Int32(self.G - 1)
+            rows = Int32(0)
+            if in_problem:
+                rows = Int32(self.split_sizes[group])
+            chunk_delta, split_delta, group_tile_delta, scale_split_delta = (
+                self._advance_group_prefixes(
+                    rows, Int32(0), Int32(0), Int32(0), Int32(0)
+                )
+            )
+            group_tile_delta = _warp_inclusive_sum(group_tile_delta)
+            # Chunks hold whole token tiles, so a group has m_tiles x its token tiles.
+            end = self.tile_start + m_tiles * group_tile_delta
+            skipped = in_problem and end <= tile_idx
+            count = cute.arch.popc(cute.arch.vote_ballot_sync(skipped))
+            if count > Int32(0):
+                last = count - Int32(1)
+                self.chunk_prefix += cute.arch.shuffle_sync(
+                    _warp_inclusive_sum(chunk_delta), last
+                )
+                self.split_prefix += cute.arch.shuffle_sync(
+                    _warp_inclusive_sum(split_delta), last
+                )
+                self.group_tile_prefix += cute.arch.shuffle_sync(group_tile_delta, last)
+                self.scale_split_prefix += cute.arch.shuffle_sync(
+                    _warp_inclusive_sum(scale_split_delta), last
+                )
+                self.tile_start = cute.arch.shuffle_sync(end, last)
+                self.group_idx += count
+            more = count == Int32(32)
+
+    @cute.jit
     def _advance_problem_to_contain(self, tile_idx: Int32) -> None:
         while (
             self.initialized == Int32(0) or tile_idx >= self.tile_end
@@ -1297,7 +1353,7 @@ class ChunkedMegaProblemVisitor:
             else:
                 self.tile_start = self.tile_end
                 self._advance_slot()
-            self._seek_valid_slot()
+            self._seek_valid_slot(tile_idx)
 
     @cute.jit
     def get_work(self, tile_idx: Int32) -> ChunkedMegaWorkTileInfo:
@@ -2105,6 +2161,17 @@ if TYPE_CHECKING:
         scheduler: MegaStaticScheduler,
     ) -> TileScheduler:
         return scheduler
+
+
+@cute.jit
+def _warp_inclusive_sum(value: Int32) -> Int32:
+    """Inclusive prefix sum of `value` over the warp's lanes; every lane must call it."""
+    lane = cute.arch.lane_idx()
+    for step in cutlass.range_constexpr(5):
+        other = cute.arch.shuffle_sync_up(value, 1 << step)
+        if lane >= Int32(1 << step):
+            value += other
+    return value
 
 
 @cute.jit

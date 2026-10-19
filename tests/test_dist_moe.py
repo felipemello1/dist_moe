@@ -2584,6 +2584,37 @@ class DistMoeKernelTest(unittest.TestCase):
                         outputs.append(actual_TD)
                 torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
 
+    def test_mxfp8_mega_inference_sparse_experts_match_reference(self) -> None:
+        """Mega finds the right expert after runs of empty experts.
+
+        Rows only in experts 0, 5, 6, 40 and 63 of 64. Fused-SwiGLU weights select the
+        decode schedule. Empty experts 7-39 take two 32-wide skip steps, and the last
+        expert has rows. Within MXFP8 tolerance of the dense reference.
+        """
+        policy = dist_moe.BlockScaledConfig(pipeline="mega")
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+            num_experts=64, num_tokens=40, block_scaled=policy
+        )
+        x_TD, _, topk_scores_TK = case_a
+        used = torch.tensor([0, 5, 6, 40, 63], device="cuda")
+        topk_expert_ids_TK = used[(torch.arange(40)[:, None] + torch.arange(2)) % 5]
+        weights = (
+            dist_moe.prepare_block_scaled_weight(
+                w13_EFD, policy, inference=True, fuse_swiglu=True
+            ),
+            dist_moe.prepare_block_scaled_weight(w2_EDF, policy, inference=True),
+        )
+        with torch.no_grad():
+            actual_TD = dist_moe.routed_experts(
+                x_TD, topk_expert_ids_TK, topk_scores_TK, *weights, context
+            )
+        expected_TD = _reference_moe(
+            x_TD, topk_expert_ids_TK, topk_scores_TK, w13_EFD, w2_EDF
+        )
+        _rtol, _atol, relative_l2, cosine = _blockscaled_tolerance(policy.format, "fwd")
+        self.assertLess(_relative_l2(actual_TD, expected_TD), relative_l2)
+        self.assertGreater(_cosine_similarity(actual_TD, expected_TD), cosine)
+
     def test_mxfp8_inference_accepts_rmsnorm_weight(self) -> None:
         """Registered MXFP8 inference with a weighted RMSNorm matches eager bitwise."""
         for pipeline, fuse_swiglu in (("staged", False), ("mega", True)):
