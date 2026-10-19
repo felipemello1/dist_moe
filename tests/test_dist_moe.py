@@ -2553,6 +2553,46 @@ class DistMoeKernelTest(unittest.TestCase):
                         outputs.append(actual_TD)
                 torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
 
+    def test_mxfp8_inference_accepts_rmsnorm_weight(self) -> None:
+        """Registered MXFP8 inference with a weighted RMSNorm matches eager bitwise."""
+        for pipeline, fuse_swiglu in (("staged", False), ("mega", True)):
+            with self.subTest(pipeline=pipeline):
+                policy = dist_moe.BlockScaledConfig(pipeline=pipeline)
+                context, case_a, _, w13_EFD, w2_EDF = self._create_case(
+                    inference=True, block_scaled=policy
+                )
+                weights = (
+                    dist_moe.prepare_block_scaled_weight(
+                        w13_EFD, policy, inference=True, fuse_swiglu=fuse_swiglu
+                    ),
+                    dist_moe.prepare_block_scaled_weight(
+                        w2_EDF, policy, inference=True
+                    ),
+                )
+                norm = partial(
+                    dist_moe.RMSNormPostprocess,
+                    eps=1e-6,
+                    norm_output_dtype=torch.float32,
+                    output_dtype=torch.bfloat16,
+                    weight=torch.randn_like(case_a[0][0]),  # [D]
+                    gain_center=1.0,
+                )
+                outputs = []
+                # An observer makes the call eager, which already passes inference.
+                for observer in (None, lambda _value: None):
+                    options = dist_moe.ExecutionOptions(
+                        experts_output_postprocess=norm(
+                            observe_expert_output_fn=observer
+                        )
+                    )
+                    with torch.no_grad():
+                        outputs.append(
+                            dist_moe.routed_experts(
+                                *case_a, *weights, context, options=options
+                            )
+                        )
+                torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+
     def test_blockscaled_modes_are_visible_to_non_strict_tracing(self) -> None:
         """Trace every supported block-scaled training and inference mode."""
 
