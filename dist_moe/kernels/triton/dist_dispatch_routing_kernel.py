@@ -171,15 +171,19 @@ def _triton_decode_dispatch_routing(
     BLOCK_EXPERTS: tl.constexpr,
     BLOCK_LOCAL_EXPERTS: tl.constexpr,
     BLOCK_WORLD_SIZE: tl.constexpr,
+    NUM_CHUNKS: tl.constexpr,
 ):
-    source_rank = tl.program_id(0)
+    # One CTA per (source rank, chunk of BLOCK_SLOTS route slots).
+    pid = tl.program_id(0)
+    source_rank = pid // NUM_CHUNKS
+    chunk = pid % NUM_CHUNKS
     _trap_if_peer_token_counts_differ(
         routing_buffer_ptrs,
         num_tokens,
         world_size,
         BLOCK_WORLD_SIZE,
     )
-    slot_offsets = tl.arange(0, BLOCK_SLOTS)
+    slot_offsets = chunk * BLOCK_SLOTS + tl.arange(0, BLOCK_SLOTS)
     valid_slots = slot_offsets < num_tokens * topk
 
     routing_buffer_ptrs = routing_buffer_ptrs.to(tl.pointer_type(tl.uint64))
@@ -203,7 +207,7 @@ def _triton_decode_dispatch_routing(
 
     sync_threads()
     if get_flat_tid() == 0:
-        _decode_routing_arrive_and_wait(completed_ctas_ptr, world_size)
+        _decode_routing_arrive_and_wait(completed_ctas_ptr, world_size * NUM_CHUNKS)
     sync_threads()
 
     all_expert_ids = tl.arange(0, BLOCK_EXPERTS)
@@ -231,7 +235,7 @@ def _triton_decode_dispatch_routing(
     else:
         padded_local_expert_counts = local_expert_counts
 
-    if source_rank == 0:
+    if pid == 0:
         if has_max_num_recv_tokens:
             total_stored_tokens = tl.sum(
                 tl.where(
@@ -250,13 +254,21 @@ def _triton_decode_dispatch_routing(
             padded_local_expert_counts,
             mask=local_expert_ids < num_local_experts,
         )
-        counts_by_rank = tl.reshape(
-            padded_expert_counts,
-            (world_size, num_local_experts),
+        # Sum counts per owning rank; unlike a reshape, this works when
+        # num_local_experts is not a power of two.
+        rank_ids = tl.arange(0, BLOCK_WORLD_SIZE)
+        expert_ranks = all_expert_ids // num_local_experts
+        rank_counts = tl.sum(
+            tl.where(
+                expert_ranks[None, :] == rank_ids[:, None],
+                padded_expert_counts[None, :],
+                0,
+            ),
+            axis=1,
         )
-        rank_counts = tl.sum(counts_by_rank, axis=1)
-        rank_ids = tl.arange(0, world_size)
-        tl.store(num_tokens_per_rank_ptr + rank_ids, rank_counts)
+        tl.store(
+            num_tokens_per_rank_ptr + rank_ids, rank_counts, mask=rank_ids < world_size
+        )
 
     local_expert_indices = expert_ids - local_expert_start
     routes_to_local_expert = (
@@ -264,13 +276,15 @@ def _triton_decode_dispatch_routing(
         & (local_expert_indices >= 0)
         & (local_expert_indices < num_local_experts)
     )
-    expert_prefixes = tl.sum(
-        tl.where(
-            local_expert_ids[None, :] < local_expert_indices[:, None],
-            padded_local_expert_counts[None, :],
-            0,
-        ),
-        axis=1,
+    # Each local expert's first row (exclusive prefix), then one lookup per slot.
+    # Non-local slots look up entry 0; the stores below mask them out.
+    local_expert_starts = (
+        tl.cumsum(padded_local_expert_counts, axis=0) - padded_local_expert_counts
+    )
+    expert_prefixes = tl.gather(
+        local_expert_starts,
+        tl.where(routes_to_local_expert, local_expert_indices, 0),
+        axis=0,
     )
     output_rows = expert_prefixes.to(tl.int64) + expert_slots.to(tl.int64)
 
