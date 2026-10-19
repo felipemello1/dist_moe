@@ -1394,6 +1394,36 @@ class DistMoeConfigTest(unittest.TestCase):
                     all(ret.alias_info is None for ret in accumulate_op._schema.returns)
                 )
 
+    def test_block_major_relayout_into_out_matches_in_place(self) -> None:
+        """``out=`` receives the in-place relayout's exact bytes; ``weight`` stays.
+
+        Both paths must equal a layout built independently with transposes, so
+        a wrong shared view fails too, and the BF16 block-major kernel tests'
+        coverage carries to ``out=``. Cases: W13 interleaved and not, with
+        N = 384 (12 gate/up groups of 16 when interleaved) and three K blocks.
+        """
+        torch.manual_seed(0)
+        weight = torch.randn(3, 384, 192, dtype=torch.bfloat16)
+        for interleave_gate_up in (False, True):
+            with self.subTest(interleave_gate_up=interleave_gate_up):
+                rows = weight
+                if interleave_gate_up:
+                    rows = weight.view(3, 2, 12, 16, 192).transpose(1, 2)
+                expected = rows.reshape(3, 384, 3, 64).transpose(1, 2)
+                in_place = weight.clone()
+                dist_moe.relayout_to_block_major(
+                    in_place, interleave_gate_up=interleave_gate_up
+                )
+                source, out = weight.clone(), torch.empty_like(weight)
+                dist_moe.relayout_to_block_major(
+                    source, interleave_gate_up=interleave_gate_up, out=out
+                )
+                torch.testing.assert_close(
+                    in_place, expected.reshape(3, 384, 192), rtol=0, atol=0
+                )
+                torch.testing.assert_close(out, in_place, rtol=0, atol=0)
+                torch.testing.assert_close(source, weight, rtol=0, atol=0)
+
 
 @pytest.mark.gpus_needed_1
 @pytest.mark.gb10x
