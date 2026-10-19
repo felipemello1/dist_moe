@@ -5687,17 +5687,17 @@ class DistMoeTwoRankTest(unittest.TestCase):
     def test_bf16_decode_routing_matches_general_routing(self) -> None:
         """Chunked decode routing gives the general routing path's exact output.
 
-        BF16 inference on 256 experts at 8, 2048 and 8192 route slots per
-        rank, i.e. one, two and eight decode routing CTAs per source rank. Each
-        output must be bitwise equal to the same call with decode routing
-        disabled, and the decode path must have run; no other test reaches more
-        than 1024 slots.
+        BF16 inference on 384 experts (192 per rank, not a power of two) at 8,
+        2048 and 8192 route slots per rank, i.e. one, two and eight decode
+        routing CTAs per source rank. Each output must be bitwise equal to the
+        same call with decode routing disabled, and the decode path must have
+        run; no other test reaches these expert counts or more than 1024 slots.
         """
         import dist_moe._routing_metadata as routing_impl
 
         rank = dist.get_rank()
         device = torch.device("cuda", rank)
-        num_experts, top_k, hidden_dim, intermediate_dim = 256, 8, 256, 256
+        num_experts, top_k, hidden_dim, intermediate_dim = 384, 8, 256, 256
         num_local_experts = num_experts // self.world_size
         config = dist_moe.Config(
             max_num_local_input_tokens=1024,

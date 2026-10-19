@@ -290,7 +290,6 @@ def _can_use_decode_routing(
     Returns:
         Whether direct decode routing supports the request.
     """
-    num_local_experts = num_experts // world_size
     return (
         use_low_latency
         and expert_id_offset is None
@@ -298,8 +297,6 @@ def _can_use_decode_routing(
         and num_tokens * topk <= _DECODE_ROUTING_MAX_SLOTS
         and num_experts <= _DECODE_ROUTING_MAX_EXPERTS
         and _is_power_of_two(world_size)
-        and _is_power_of_two(num_experts)
-        and _is_power_of_two(num_local_experts)
         # The cooperative launch needs every CTA resident at once.
         and world_size * _decode_routing_num_chunks(num_tokens * topk)
         <= num_sms_per_device()
