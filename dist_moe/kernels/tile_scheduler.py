@@ -1301,7 +1301,6 @@ class ChunkedMegaProblemVisitor:
         slot would. Never skips the problem's last group, so `_advance_group` still
         switches FC13 to FC2. Call at a group start; every lane must call it.
         """
-        lane = cute.arch.lane_idx()
         m_tiles = (Int32(2) * self.N + Int32(self.BLOCK_SIZE_M - 1)) // Int32(
             self.BLOCK_SIZE_M
         )
@@ -1310,38 +1309,35 @@ class ChunkedMegaProblemVisitor:
                 self.BLOCK_SIZE_M * self.FC2_TILES_PER_ITEM
             )
             m_tiles = (self.K + Int32(fc2_block_m - 1)) // Int32(fc2_block_m)
-        more = cutlass.Boolean(True)
-        while more:
-            group = self.group_idx + lane
-            in_problem = group < Int32(self.G - 1)
-            rows = Int32(0)
-            if in_problem:
-                rows = Int32(self.split_sizes[group])
-            chunk_delta, split_delta, group_tile_delta, scale_split_delta = (
-                self._advance_group_prefixes(
-                    rows, Int32(0), Int32(0), Int32(0), Int32(0)
-                )
+
+        def group_tiles_and_deltas(rows):
+            deltas = self._advance_group_prefixes(
+                rows, Int32(0), Int32(0), Int32(0), Int32(0)
             )
-            group_tile_delta = _warp_inclusive_sum(group_tile_delta)
             # Chunks hold whole token tiles, so a group has m_tiles x its token tiles.
-            end = self.tile_start + m_tiles * group_tile_delta
-            skipped = in_problem and end <= tile_idx
-            count = cute.arch.popc(cute.arch.vote_ballot_sync(skipped))
-            if count > Int32(0):
-                last = count - Int32(1)
-                self.chunk_prefix += cute.arch.shuffle_sync(
-                    _warp_inclusive_sum(chunk_delta), last
-                )
-                self.split_prefix += cute.arch.shuffle_sync(
-                    _warp_inclusive_sum(split_delta), last
-                )
-                self.group_tile_prefix += cute.arch.shuffle_sync(group_tile_delta, last)
-                self.scale_split_prefix += cute.arch.shuffle_sync(
-                    _warp_inclusive_sum(scale_split_delta), last
-                )
-                self.tile_start = cute.arch.shuffle_sync(end, last)
-                self.group_idx += count
-            more = count == Int32(32)
+            return m_tiles * deltas[2], deltas
+
+        prefixes = (
+            self.chunk_prefix,
+            self.split_prefix,
+            self.group_tile_prefix,
+            self.scale_split_prefix,
+        )
+        self.group_idx, self.tile_start, prefixes = _skip_finished_groups(
+            self.split_sizes,
+            self.G,
+            self.group_idx,
+            self.tile_start,
+            tile_idx,
+            prefixes,
+            group_tiles_and_deltas,
+        )
+        (
+            self.chunk_prefix,
+            self.split_prefix,
+            self.group_tile_prefix,
+            self.scale_split_prefix,
+        ) = prefixes
 
     @cute.jit
     def _advance_problem_to_contain(self, tile_idx: Int32) -> None:
@@ -2172,6 +2168,50 @@ def _warp_inclusive_sum(value: Int32) -> Int32:
         if lane >= Int32(1 << step):
             value += other
     return value
+
+
+@cute.jit
+def _skip_finished_groups(
+    split_sizes: cute.Tensor,
+    G: cutlass.Constexpr[int],
+    group_idx: Int32,
+    tile_start: Int32,
+    tile_idx: Int32,
+    prefixes: tuple,
+    group_tiles_and_deltas,
+):
+    """Jump over the groups that end at or before `tile_idx`, 32 per warp step.
+
+    `group_tiles_and_deltas(rows)` gives a group's tile count and how much each of
+    `prefixes` grows past it. Returns `group_idx`, `tile_start` and `prefixes` where
+    stepping group by group would leave them. Never skips group G - 1. Every lane
+    of the warp must call it with the same inputs.
+
+    Example: G = 64, `tile_idx` in group 40, `group_idx` = 0: two steps, returns 40.
+    """
+    lane = cute.arch.lane_idx()
+    more = cutlass.Boolean(True)
+    while more:
+        group = group_idx + lane
+        in_problem = group < Int32(G - 1)
+        rows = Int32(0)
+        if in_problem:
+            rows = Int32(split_sizes[group])
+        group_tiles, deltas = group_tiles_and_deltas(rows)
+        end = tile_start + _warp_inclusive_sum(group_tiles)
+        count = cute.arch.popc(
+            cute.arch.vote_ballot_sync(in_problem and end <= tile_idx)
+        )
+        if count > Int32(0):
+            last = count - Int32(1)
+            prefixes = tuple(
+                prefix + cute.arch.shuffle_sync(_warp_inclusive_sum(delta), last)
+                for prefix, delta in zip(prefixes, deltas)
+            )
+            tile_start = cute.arch.shuffle_sync(end, last)
+            group_idx += count
+        more = count == Int32(32)
+    return group_idx, tile_start, prefixes
 
 
 @cute.jit
