@@ -939,6 +939,18 @@ def _chunked_mega_operand_layout(
         regions.append(_StaticOperandRegion(name, shape, dtype, cursor, size_bytes))
         cursor += size_bytes
 
+    # First, so routing can clear this view before the token tile is resolved
+    # (`_static_counters_view`).
+    reserve(
+        "counters",
+        (
+            _static_counter_count(
+                rows=rows, groups=groups, hidden_dim=hidden_dim, format=format
+            ),
+        ),
+        torch.int32,
+        4,
+    )
     for prefix, dim in (("x", hidden_dim), ("h2", intermediate_dim)):
         reserve(
             prefix + "_row_q",
@@ -980,20 +992,6 @@ def _chunked_mega_operand_layout(
             _BF16_BYTES,
         )
     reserve("h3_descriptor", (1, hidden_dim), torch.bfloat16, _BF16_BYTES)
-    dispatch_done = sum(
-        base._mega_dispatch_done_counter_sizes(
-            rows=rows, dim=hidden_dim, num_groups=groups, format=format
-        )
-    )
-    activation_done = sum(
-        base._mega_forward_done_counter_sizes(rows=rows, format=format)
-    )
-    counter_splits = _pipeline_counter_storage_splits(
-        input_done_counter_size=dispatch_done,
-        activation_done_counter_size=activation_done,
-        pipeline_counter_size=_PIPELINE_COUNTER_SIZE,
-    )
-    reserve("counters", (sum(counter_splits),), torch.int32, 4)
     num_ctas = _CHUNKED_MEGA_NUM_CTAS
     grid_size = max(max(1, num_sms // num_ctas) * num_ctas, groups)
     reserve(
@@ -1196,6 +1194,27 @@ def _pipeline_counter_storage_splits(
     )
 
 
+def _static_counter_count(*, rows: int, groups: int, hidden_dim: int, format) -> int:
+    """Int32 pipeline counters of a forward-only launch with `rows` capacity."""
+    input_counter_sizes = base._mega_dispatch_done_counter_sizes(
+        rows=rows,
+        dim=hidden_dim,
+        num_groups=groups,
+        format=format,
+    )
+    activation_counter_sizes = base._mega_forward_done_counter_sizes(
+        rows=rows,
+        format=format,
+    )
+    return sum(
+        _pipeline_counter_storage_splits(
+            input_done_counter_size=sum(input_counter_sizes),
+            activation_done_counter_size=sum(activation_counter_sizes),
+            pipeline_counter_size=_PIPELINE_COUNTER_SIZE,
+        )
+    )
+
+
 def allocate_decode_counter_storage(
     *,
     rows: int,
@@ -1205,22 +1224,28 @@ def allocate_decode_counter_storage(
     device: torch.device,
 ) -> torch.Tensor:
     """Allocate counters cleared by the decode routing preparation launch."""
-    input_counter_sizes = base._mega_dispatch_done_counter_sizes(
-        rows=rows,
-        dim=hidden_dim,
-        num_groups=num_groups,
-        format=format,
+    count = _static_counter_count(
+        rows=rows, groups=num_groups, hidden_dim=hidden_dim, format=format
     )
-    activation_counter_sizes = base._mega_forward_done_counter_sizes(
-        rows=rows,
-        format=format,
+    return torch.empty(count, dtype=torch.int32, device=device)
+
+
+def _static_counters_view(
+    operand_storage: torch.Tensor, *, rows: int, groups: int, hidden_dim: int, format
+) -> torch.Tensor:
+    """Return the int32 counters at the front of static Mega `operand_storage`.
+
+    Same view for every token tile, so routing can zero it before the launch picks
+    one. Pass it to the launch as `counter_storage`.
+
+    Example:
+        >>> _static_counters_view(storage, rows=1024, groups=8, hidden_dim=256, format=MXFP8_E4M3).shape
+        torch.Size([109])  # storage[0:436] viewed as int32
+    """
+    count = _static_counter_count(
+        rows=rows, groups=groups, hidden_dim=hidden_dim, format=format
     )
-    counter_splits = _pipeline_counter_storage_splits(
-        input_done_counter_size=sum(input_counter_sizes),
-        activation_done_counter_size=sum(activation_counter_sizes),
-        pipeline_counter_size=_PIPELINE_COUNTER_SIZE,
-    )
-    return torch.empty(sum(counter_splits), dtype=torch.int32, device=device)
+    return operand_storage[: 4 * count].view(torch.int32)
 
 
 def _validate_interleaved_feature_tile(

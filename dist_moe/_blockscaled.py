@@ -74,6 +74,7 @@ from ._postprocess import (
 )
 from ._quantization import quantize_for_format
 from ._routing_metadata import (
+    _can_use_decode_routing,
     _routing_ptrs_size,
     dist_dispatch_routing,
 )
@@ -1614,6 +1615,41 @@ class _BlockScaledAutograd(torch.autograd.Function):
             blockscaled_cfg=blockscaled_cfg,
         )
 
+        capacity_rows = model_config.max_recv_tokens
+        if inference_mode and blockscaled_cfg.mega:
+            # Descriptor/tile allocation is 128-aligned; routing's
+            # logical padded-row overflow bound remains unchanged.
+            capacity_rows = (capacity_rows + 127) // 128 * 128
+        # Decode routing zeroes Mega's counters in its clear launch, so Mega skips its
+        # memset. Other calls keep Mega's own clearing: precleared counters with device
+        # tensor maps switch Mega to in-kernel descriptor preparation, which is slower.
+        mega_counters = None
+        if (
+            static_inference_storage
+            and config is not None
+            and config.get("USE_DEVICE_TENSORMAPS", True) is False
+            and _can_use_decode_routing(
+                use_low_latency=inference_mode,
+                expert_id_offset=None,
+                generate_bwd_gather_ptrs=save_for_backward,
+                world_size=routing_world_size,
+                num_tokens=num_tokens,
+                topk=topk,
+                num_experts=num_experts,
+            )
+        ):
+            from .kernels.chunked_mega_blockscaled_grouped_gemm import (
+                _static_counters_view,
+            )
+
+            mega_counters = _static_counters_view(
+                activation_buffer.buffer,
+                rows=capacity_rows,
+                groups=local_expert_count,
+                hidden_dim=hidden_dim,
+                format=_kernel_format(blockscaled_cfg.format),
+            )
+
         with record_function("moe_dispatch_routing"):
             routing = dist_dispatch_routing(
                 tokens=x_TD,
@@ -1631,6 +1667,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                 pointer_capacity_multiple_of=(
                     128 if inference_mode and blockscaled_cfg.mega else 1
                 ),
+                counter_workspaces=() if mega_counters is None else (mega_counters,),
             )
 
             num_tokens_per_local_expert_E = routing.num_tokens_per_local_experts
@@ -1700,11 +1737,6 @@ class _BlockScaledAutograd(torch.autograd.Function):
                         and forward_plan.blockscaled is not None
                     )
                     blockscaled_forward_plan = forward_plan.blockscaled
-                capacity_rows = model_config.max_recv_tokens
-                if inference_mode and blockscaled_cfg.mega:
-                    # Descriptor/tile allocation is 128-aligned; routing's
-                    # logical padded-row overflow bound remains unchanged.
-                    capacity_rows = (capacity_rows + 127) // 128 * 128
                 if blockscaled_cfg.mega:
                     mega_result = (
                         dist_blockscaled_grouped_gemm_fprop_swiglu_fwd_dispatch_combine(
@@ -1749,6 +1781,7 @@ class _BlockScaledAutograd(torch.autograd.Function):
                                 if static_inference_storage
                                 else None
                             ),
+                            counter_storage=mega_counters,
                             activation_offsets=(
                                 None
                                 if blockscaled_forward_plan is None
