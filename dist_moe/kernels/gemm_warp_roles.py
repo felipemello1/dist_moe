@@ -37,6 +37,7 @@ from .dispatch_quant import (
 from .grouped_gemm import (
     _FPROP,
 )
+from .grouped_gemm_kernel import _weight_l2_policy
 from .params import (
     ChunkedGemmWarpParams,
     DispatchQuantSync as _MegaDispatchQuantSync,
@@ -563,24 +564,6 @@ def _wait_before_tma_load(
             format=format,
             sf_vec_size=sf_vec_size,
         )
-
-
-# createpolicy.fractional encodings for the TMA cache-policy operand.
-_L2_EVICT_NORMAL = 0x1000000000000000
-_L2_EVICT_FIRST = 0x12F0000000000000
-
-
-@cute.jit
-def _weight_l2_policy(group_rows, block_n: cutlass.Constexpr[int]):
-    """L2 policy for a group's weight (A/SFA) loads under SWAP_AB. When the
-    group's routed rows fit one token tile, each weight tile is read exactly
-    once, so it streams evict-first instead of displacing the reused
-    activation tiles and the combine writes. Larger groups re-read every
-    weight tile per token tile and keep the normal policy."""
-    policy = cutlass.Int64(_L2_EVICT_NORMAL)
-    if group_rows <= cutlass.Int32(block_n):
-        policy = cutlass.Int64(_L2_EVICT_FIRST)
-    return policy
 
 
 @cute.jit

@@ -408,6 +408,26 @@ def _get_tile_coords(
     return tile_m_idx, tile_n_idx
 
 
+# createpolicy.fractional encodings for the TMA cache-policy operand.
+_L2_EVICT_NORMAL = 0x1000000000000000
+_L2_EVICT_FIRST = 0x12F0000000000000
+
+
+@cute.jit
+def _weight_l2_policy(group_rows, token_tile: cutlass.Constexpr[int]):
+    """L2 policy for a group's weight loads. When the group's routed rows fit
+    one token tile, each weight tile is read exactly once, so it streams
+    evict-first instead of displacing the reused activation tiles and the
+    combine writes. Larger groups re-read every weight tile per token tile
+    and keep the normal policy."""
+    # A select, not an `if`: a policy yielded by a dynamic `if` fails to
+    # compile in the fused-SwiGLU dispatch kernels.
+    larger = cutlass.Int64(group_rows > cutlass.Int32(token_tile))
+    return cutlass.Int64(_L2_EVICT_FIRST) + larger * cutlass.Int64(
+        _L2_EVICT_NORMAL - _L2_EVICT_FIRST
+    )
+
+
 @cute.jit
 def _epilog_wait_pending_tma_store():
     """Drain the previous SMEM->GMEM store before reusing the C SMEM tile."""
@@ -1585,6 +1605,12 @@ class GroupedGemmKernel:
                 if cutlass.const_expr(not self.host_b_tensormap):
                     tensormap_manager.fence_tensormap_update(tensormap_b_ptr)
 
+                # The weights are the B operand only in a non-swapped forward; it always
+                # loads B via the host tensormap, so the other copies stay as is.
+                b_policy = None
+                if cutlass.const_expr(problem_type == _FPROP and not self.SWAP_AB):
+                    b_policy = _weight_l2_policy(m_size, self.BLOCK_SIZE_M)
+
                 # Loop while current tile_idx falls within this group.
                 while work.is_valid_tile and work.group_idx == g:
                     scheduler.producer_publish_tile(accum_cnt_out)
@@ -1656,6 +1682,7 @@ class GroupedGemmKernel:
                                         tBsB[(None, buf)],
                                         tma_bar_ptr=ab_full_mbar + buf,
                                         mcast_mask=b_full_mcast_mask,
+                                        cache_policy=b_policy,
                                     )
                                 else:
                                     b_desc_ptr = tensormap_manager.get_tensormap_ptr(
@@ -1776,6 +1803,7 @@ class GroupedGemmKernel:
                                 tBsB[(None, buf)],
                                 tma_bar_ptr=ab_full_mbar + buf,
                                 mcast_mask=b_full_mcast_mask,
+                                cache_policy=b_policy,
                             )
                         else:
                             b_desc_ptr = tensormap_manager.get_tensormap_ptr(
