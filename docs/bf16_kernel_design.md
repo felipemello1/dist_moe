@@ -57,7 +57,7 @@ specialization contract.
 
 Training and backward patch the activation (A) TMA descriptor once per expert,
 after the previous expert's last load lands. BF16 inference FPROP (one-CTA,
-non-swapped, unpadded) instead patches one descriptor per CTA over every
+unpadded; A, or B when swapped) instead patches one descriptor per CTA over every
 expert's rows and addresses expert `e` at row `sum(split_sizes[:e])`, so decode
 tiles, whose consecutive tiles belong to different experts, skip the patch, the
 fence and the wait. A tile's last rows may then load the next expert's rows:
@@ -78,10 +78,11 @@ row-major:    r0[0:64] r0[64:128] r1[0:64] r1[64:128] ...
 block-major:  r0[0:64] r1[0:64] ... r(N-1)[0:64] r0[64:128] r1[64:128] ...
 ```
 
-The FPROP dispatch and combine kernels view B as `(N, (64, K/64), G) :
-(64, (1, 64N), NK)`; the TMA atom and partitions are unchanged. Only BF16
-inference supports it: DGRAD and WGRAD read the weights row-major, and the
-fused SwiGLU dispatch epilogue is not used with it.
+The FPROP dispatch and combine kernels view the weight operand (B, or A when
+swapped) as `(N, (64, K/64), G) : (64, (1, 64N), NK)`; the TMA atom and
+partitions are unchanged. Only BF16 inference supports it: DGRAD and WGRAD
+read the weights row-major, and the fused SwiGLU dispatch epilogue is not used
+with it.
 
 <a id="cta-roles"></a>
 ## CTA roles

@@ -218,7 +218,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         swiglu_emit_h1: bool = False,
         gather_k_segments: int = _GATHER_K_SEGMENTS,
         use_pdl: bool = False,
-        block_major_b: bool = False,
+        block_major_weights: bool = False,
         single_a_tensormap: bool = False,
     ) -> None:
         if problem_type not in (_FPROP, _DGRAD, _WGRAD):
@@ -246,19 +246,30 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
             raise ValueError("swiglu_emit_h1 requires non-swapped DISPATCH_SWIGLU_FWD")
         if swap_ab and (
             problem_type != _FPROP
-            or mode not in (self.DISPATCH, self.DISPATCH_SWIGLU_FWD)
+            or mode not in (self.DISPATCH, self.DISPATCH_SWIGLU_FWD, self.COMBINE)
         ):
-            raise ValueError("distributed SWAP_AB supports FPROP dispatch only")
-        if block_major_b and (problem_type != _FPROP or swap_ab or swiglu_emit_h1):
-            raise ValueError("block_major_b supports non-swapped FPROP without emit_h1")
+            raise ValueError("distributed SWAP_AB supports FPROP only")
+        # Swapped COMBINE scatters a tile's tokens through one pointer table.
+        if (
+            swap_ab
+            and mode == self.COMBINE
+            and (config["NUM_CTAS"], config["NUM_MMAS"]) != (1, 1)
+        ):
+            raise ValueError("swapped COMBINE supports 1-CTA, 1-MMA tiles only")
         if single_a_tensormap and (
+            problem_type != _FPROP or host_a_tensormap or config["NUM_CTAS"] != 1
+        ):
+            raise ValueError("single_a_tensormap supports unpadded, 1-CTA FPROP only")
+        # Swapped weights need the host-built A descriptor: per-group descriptor
+        # updates write row-major strides.
+        if block_major_weights and (
             problem_type != _FPROP
-            or swap_ab
-            or host_a_tensormap
-            or config["NUM_CTAS"] != 1
+            or swiglu_emit_h1
+            or (swap_ab and not single_a_tensormap)
         ):
             raise ValueError(
-                "single_a_tensormap supports non-swapped, unpadded, 1-CTA FPROP only"
+                "block_major_weights supports FPROP without emit_h1, and swapped "
+                "FPROP only with single_a_tensormap"
             )
         super().__init__(
             config=config,
@@ -281,7 +292,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         self.swiglu_emit_h1 = swiglu_emit_h1
         self.has_padding_sentinels = has_padding_sentinels
         self.use_pdl = use_pdl
-        self.block_major_b = block_major_b
+        self.block_major_weights = block_major_weights
         self.SINGLE_A_TENSORMAP = single_a_tensormap
         self.output_accum = output_accum
         # 2CTA needs finer gather granularity because CuTe splits one M
@@ -363,6 +374,10 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
             epi_n = cute.size(self.epi_tile[1])
             row_skew = 8 if self.NUM_TMEM_BUFFERS == 1 or self.NUM_C_STAGES > 1 else 0
             if self.SWAP_AB:
+                if self.mode == self.COMBINE and epi_n != self.BLOCK_SIZE_N:
+                    raise ValueError(
+                        "swapped COMBINE needs epilogue subtiles spanning the token tile"
+                    )
                 col_stride = epi_m + row_skew
                 self.c_smem_layout_staged = cute.make_layout(
                     (epi_m, epi_n, 1), stride=(1, col_stride, epi_n * col_stride)
@@ -552,7 +567,8 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
             DIAG_N_BANDS=self.DIAG_N_BANDS,
         )
         work = visitor.get_work(tile_idx)
-        swiglu_sC = _transpose_c_if_swap(sC, self.SWAP_AB)
+        # Token rows of contiguous features, swapped or not.
+        row_major_sC = _transpose_c_if_swap(sC, self.SWAP_AB)
 
         while work.is_valid_tile:
             m_size = work.m_size
@@ -574,6 +590,15 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
 
                     tile_m_idx = work.tile_m_idx
                     tile_n_idx = work.tile_n_idx
+                    # The scatter and the SwiGLU store walk token rows; swapped
+                    # tiles hold tokens on N.
+                    token_tile_idx, feature_tile_idx = _swap_if(
+                        self.SWAP_AB, tile_m_idx, tile_n_idx
+                    )
+                    token_size, feature_size = _swap_if(self.SWAP_AB, m_size, n_size)
+                    token_block, feature_block = _swap_if(
+                        self.SWAP_AB, BLOCK_SIZE_M, BLOCK_SIZE_N
+                    )
 
                     # Wait MMA done for this tmem buffer.
                     if cutlass.const_expr(not self.SPLIT_ATOM_ACCUM):
@@ -602,16 +627,16 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                                 for ld_m_idx in cutlass.range_constexpr(PTR_ATOMS):
                                     self._combine_epilog_load_scatter_ptrs(
                                         tidx=tidx,
-                                        sC=sC,
+                                        sC=row_major_sC,
                                         scatter_ptr_smem_ptr=scatter_ptr_smem_ptr
                                         + ld_m_idx * EPILOGUE_M,
-                                        tile_m_idx=tile_m_idx,
+                                        tile_m_idx=token_tile_idx,
                                         mma_m_idx=mma_m_idx + ld_m_idx,
                                         cm_start=cm_start,
-                                        m_size=m_size,
+                                        m_size=token_size,
                                         scatter_ptrs_addr_i64=scatter_ptrs_addr_i64,
                                         padding_row_addr_i64=padding_row_addr_i64,
-                                        BLOCK_SIZE_M=BLOCK_SIZE_M,
+                                        BLOCK_SIZE_M=token_block,
                                         NUM_MMA_ATOMS_M=NUM_MMA_ATOMS_M,
                                         NUM_CTAS=NUM_CTAS,
                                         cluster_cta_rank=cluster_cta_rank,
@@ -711,9 +736,6 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                                         )
 
                                     if cutlass.const_expr(fuse_swiglu_fwd):
-                                        swiglu_tile_m_idx, swiglu_tile_n_idx = _swap_if(
-                                            self.SWAP_AB, tile_m_idx, tile_n_idx
-                                        )
                                         swiglu_mma_m_idx, swiglu_mma_n_idx = _swap_if(
                                             self.SWAP_AB, mma_m_idx, mma_n_idx
                                         )
@@ -725,32 +747,22 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                                             NUM_MMA_ATOMS_M,
                                             NUM_MMA_ATOMS_N,
                                         )
-                                        swiglu_m_size, swiglu_n_size = _swap_if(
-                                            self.SWAP_AB, m_size, n_size
-                                        )
-                                        swiglu_block_size_m, swiglu_block_size_n = (
-                                            _swap_if(
-                                                self.SWAP_AB,
-                                                BLOCK_SIZE_M,
-                                                BLOCK_SIZE_N,
-                                            )
-                                        )
                                         store_interleaved_swiglu_smem_tile(
                                             tidx=tidx,
-                                            sC_stage=swiglu_sC[(None, None, 0)],
+                                            sC_stage=row_major_sC[(None, None, 0)],
                                             m_output_words=mSwigluOutputWords,
-                                            tile_m_idx=swiglu_tile_m_idx,
-                                            tile_n_idx=swiglu_tile_n_idx,
+                                            tile_m_idx=token_tile_idx,
+                                            tile_n_idx=feature_tile_idx,
                                             mma_m_idx=swiglu_mma_m_idx,
                                             mma_n_idx=swiglu_mma_n_idx,
                                             subtile_idx=subtile_idx,
                                             num_mma_atoms_m=swiglu_num_mma_atoms_m,
                                             num_mma_atoms_n=swiglu_num_mma_atoms_n,
                                             cm_start=cm_start,
-                                            m_size=swiglu_m_size,
-                                            n_size=swiglu_n_size,
-                                            block_size_m=swiglu_block_size_m,
-                                            block_size_n=swiglu_block_size_n,
+                                            m_size=token_size,
+                                            n_size=feature_size,
+                                            block_size_m=token_block,
+                                            block_size_n=feature_block,
                                             num_ctas=NUM_CTAS,
                                             cluster_cta_rank=cluster_cta_rank,
                                             cluster_split_m=not self.SWAP_AB,
@@ -762,21 +774,21 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                                     else:
                                         self._combine_epilog_scatter_smem_tile(
                                             tidx=tidx,
-                                            sC=sC,
+                                            sC=row_major_sC,
                                             scatter_ptr_smem_ptr=ptr_tab,
-                                            tile_m_idx=tile_m_idx,
-                                            tile_n_idx=tile_n_idx,
+                                            tile_m_idx=token_tile_idx,
+                                            tile_n_idx=feature_tile_idx,
                                             mma_m_idx=mma_m_idx,
                                             mma_n_idx=mma_n_idx,
                                             subtile_idx=subtile_idx,
                                             NUM_MMA_ATOMS_M=NUM_MMA_ATOMS_M,
                                             NUM_MMA_ATOMS_N=NUM_MMA_ATOMS_N,
                                             cm_start=cm_start,
-                                            m_size=m_size,
-                                            n_size=n_size,
+                                            m_size=token_size,
+                                            n_size=feature_size,
                                             elem_size_bytes_c=elem_size_bytes_c,
-                                            BLOCK_SIZE_M=BLOCK_SIZE_M,
-                                            BLOCK_SIZE_N=BLOCK_SIZE_N,
+                                            BLOCK_SIZE_M=token_block,
+                                            BLOCK_SIZE_N=feature_block,
                                             NUM_CTAS=NUM_CTAS,
                                             cluster_cta_rank=cluster_cta_rank,
                                         )
@@ -1145,16 +1157,24 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                 cute.make_tensor(gathered_offsets_ptr, cute.make_layout(1))[0]
             )
             if (cute.arch.block_idx()[0] == 0) & (tidx == 0):
+                # Swapped dispatch transposes C and moves the tokens to B.
+                output_row_stride = c_s1 if self.SWAP_AB else c_s0
+                gathered_row_stride = b_s0 if self.SWAP_AB else a_s0
+                gathered_elem_bytes = (
+                    elem_size_bytes_b if self.SWAP_AB else elem_size_bytes_a
+                )
                 output_byte_extent = _packed_group_rows_byte_extent(
                     split_sizes,
-                    a_s1 if problem_type == _WGRAD else c_s0,
+                    a_s1 if problem_type == _WGRAD else output_row_stride,
                     elem_size_bytes_a if problem_type == _WGRAD else elem_size_bytes_c,
                     G,
                 )
                 gathered_byte_extent = _packed_group_rows_byte_extent(
                     split_sizes,
-                    b_s1 if problem_type == _WGRAD else a_s0,
-                    elem_size_bytes_b if problem_type == _WGRAD else elem_size_bytes_a,
+                    b_s1 if problem_type == _WGRAD else gathered_row_stride,
+                    elem_size_bytes_b
+                    if problem_type == _WGRAD
+                    else gathered_elem_bytes,
                     G,
                 )
                 _require_valid_activation_buffer_range(
@@ -1172,6 +1192,10 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
             if cutlass.const_expr(problem_type == _WGRAD):
                 effective_a_base_ptr = activation_buffer_base_ptr + y_off
                 effective_b_base_ptr = activation_buffer_base_ptr + x_g_off
+            elif cutlass.const_expr(self.SWAP_AB):
+                # Swapped dispatch: the gathered tokens are the B operand.
+                effective_b_base_ptr = activation_buffer_base_ptr + x_g_off
+                effective_c_base_ptr = activation_buffer_base_ptr + y_off
             else:
                 effective_a_base_ptr = activation_buffer_base_ptr + x_g_off
                 effective_c_base_ptr = activation_buffer_base_ptr + y_off
@@ -1224,7 +1248,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                     gather_block_m = AG_BLOCK_SIZE_M
                     gather_features = N
                 if cutlass.const_expr(self.SWAP_AB):
-                    gather_base_ptr = b_base_ptr
+                    gather_base_ptr = effective_b_base_ptr
                     gather_stride = b_s0
                     gather_elem_size = elem_size_bytes_b
                     gather_block_m = BLOCK_SIZE_N
@@ -1318,6 +1342,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                     NUM_CTAS=NUM_CTAS,
                     secondary_operands=secondary_operands,
                     a_coord_layout=mA.layout,
+                    b_coord_layout=mB.layout,
                 )
         elif warp_idx == DIST_MMA_WARP_ID:  # MMA consumer
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
@@ -1827,23 +1852,28 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         # tensormap update inherits from the base machinery. Addresses
         # are 128-byte aligned by host construction.
         effective_a_base_ptr = a_base_ptr
+        effective_b_base_ptr = b_base_ptr
         if cutlass.const_expr(USE_ACTIVATION_BUFFER):
             x_off = cutlass.Int64(
                 cute.make_tensor(input_offsets_ptr, cute.make_layout(1))[0]
             )
             if (cute.arch.block_idx()[0] == 0) & (tidx == 0):
+                # Swapped combine moves the input rows to B.
                 _require_valid_activation_buffer_range(
                     byte_offset=x_off,
                     byte_extent=_packed_group_rows_byte_extent(
                         split_sizes,
-                        a_s0,
-                        elem_size_bytes_a,
+                        b_s0 if self.SWAP_AB else a_s0,
+                        elem_size_bytes_b if self.SWAP_AB else elem_size_bytes_a,
                         G,
                     ),
                     activation_buffer_size_bytes=activation_buffer_size_bytes,
                     warp_scoped_diagnostic=False,
                 )
-            effective_a_base_ptr = activation_buffer_base_ptr + x_off
+            if cutlass.const_expr(self.SWAP_AB):
+                effective_b_base_ptr = activation_buffer_base_ptr + x_off
+            else:
+                effective_a_base_ptr = activation_buffer_base_ptr + x_off
 
         if cutlass.const_expr(USE_ACTIVATION_BUFFER and fuse_swiglu_bwd):
             dz_off = cutlass.Int64(
@@ -1906,7 +1936,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                     split_sizes=split_sizes,
                     cluster_cta_rank=cluster_cta_rank,
                     a_base_ptr=effective_a_base_ptr,
-                    b_base_ptr=b_base_ptr,
+                    b_base_ptr=effective_b_base_ptr,
                     a_s0=a_s0,
                     a_s1=a_s1,
                     b_s0=b_s0,
@@ -1938,6 +1968,7 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
                     BLOCK_SIZE_K=BLOCK_SIZE_K,
                     NUM_CTAS=NUM_CTAS,
                     a_coord_layout=mA.layout,
+                    b_coord_layout=mB.layout,
                 )
         elif warp_idx == DIST_MMA_WARP_ID:  # MMA consumer
             tmem_ptr = cute.arch.retrieve_tmem_ptr(
@@ -2187,18 +2218,24 @@ class DistGroupedGemmKernel(CombineScatterMixin, GroupedGemmKernel):
         self.c_dtype = tensor_c.element_type
         self.a_major_mode = utils.LayoutEnum.from_tensor(tensor_a).mma_major_mode()
         self.b_major_mode = utils.LayoutEnum.from_tensor(tensor_b).mma_major_mode()
-        if cutlass.const_expr(self.block_major_b):
+        if cutlass.const_expr(self.block_major_weights):
             # Each group's [N, K] weight is stored as [K / 64, N, 64]: view the
-            # (N, K, G) operand with a two-level K mode so a 64-wide K tile of
-            # BLOCK_SIZE_N rows is one contiguous TMA box.
-            n_b, k_b, g_b = tensor_b.shape
-            tensor_b = cute.make_tensor(
-                tensor_b.iterator,
+            # (N, K, G) weight operand (A when swapped, else B) with a two-level
+            # K mode so each 64-wide K block of a tile's rows is one contiguous
+            # TMA box.
+            weights = tensor_a if self.SWAP_AB else tensor_b
+            n_w, k_w, g_w = weights.shape
+            weights = cute.make_tensor(
+                weights.iterator,
                 cute.make_layout(
-                    (n_b, (BLOCK_MAJOR_K, k_b // BLOCK_MAJOR_K), g_b),
-                    stride=(BLOCK_MAJOR_K, (1, BLOCK_MAJOR_K * n_b), n_b * k_b),
+                    (n_w, (BLOCK_MAJOR_K, k_w // BLOCK_MAJOR_K), g_w),
+                    stride=(BLOCK_MAJOR_K, (1, BLOCK_MAJOR_K * n_w), n_w * k_w),
                 ),
             )
+            if cutlass.const_expr(self.SWAP_AB):
+                tensor_a = weights
+            else:
+                tensor_b = weights
         self.c_layout = utils.LayoutEnum.from_tensor(tensor_c)
 
         from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode

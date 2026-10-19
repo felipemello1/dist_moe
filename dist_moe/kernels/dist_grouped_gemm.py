@@ -237,7 +237,7 @@ def _get_dist_kernel(
     swiglu_emit_h2: bool = False,
     swiglu_emit_h1: bool = False,
     use_pdl: bool = False,
-    block_major_b: bool = False,
+    block_major_weights: bool = False,
     single_a_tensormap: bool = False,
 ) -> DistGroupedGemmKernel:
     """Return a cached kernel with the exact scheduling and SwiGLU controls."""
@@ -264,7 +264,7 @@ def _get_dist_kernel(
         swiglu_emit_h2,
         swiglu_emit_h1,
         use_pdl,
-        block_major_b,
+        block_major_weights,
         single_a_tensormap,
     )
     obj = _DIST_KERNEL_CACHE.get(key)
@@ -289,7 +289,7 @@ def _get_dist_kernel(
             swiglu_emit_h1=swiglu_emit_h1,
             gather_k_segments=gather_k_segments,
             use_pdl=use_pdl,
-            block_major_b=block_major_b,
+            block_major_weights=block_major_weights,
             single_a_tensormap=single_a_tensormap,
         )
         _DIST_KERNEL_CACHE[key] = obj
@@ -311,9 +311,9 @@ def allocate_decode_counter_storage(
     return torch.empty(rows + num_groups + 2, dtype=torch.int32, device=device)
 
 
-# Smallest token tile of an activation-buffer FPROP launch: every BF16 preset
-# and auto config has BM >= 64, and SWAP_AB is rejected with the buffer.
-_MIN_ACTIVATION_BUFFER_TOKEN_TILE = 64
+# Smallest token tile of an activation-buffer FPROP launch: BF16 presets and
+# auto configs have BM >= 64; swapped inference GEMMs use BN >= 32.
+_MIN_ACTIVATION_BUFFER_TOKEN_TILE = 32
 
 
 def _activation_buffer_kernel_m(
@@ -334,7 +334,7 @@ def allocate_activation_buffer_counter_storage(
     """Allocate the counters of one activation-buffer FPROP launch; routing zeroes them.
 
     Sized for the smallest token tile, so any config fits:
-        kernel_M 1000, 64-row tiles, 64 experts -> 1 + 1 + (16 + 64) = 82 int32
+        kernel_M 1000, 32-row tiles, 64 experts -> 1 + 1 + (32 + 64) = 98 int32
 
     Args:
         activation_buffer: Byte buffer the launch reads and writes.
@@ -746,10 +746,12 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
     swap_ab = (
         bool(kernel_override.SWAP_AB)
         if kernel_override is not None
-        else problem_type == _FPROP and is_dispatch and config_swap_ab
+        else problem_type == _FPROP and config_swap_ab
     )
-    if swap_ab and use_activation_buffer:
-        raise ValueError("distributed SWAP_AB does not support activation_buffer")
+    if swap_ab and use_activation_buffer and not single_a_tensormap:
+        raise ValueError(
+            "distributed SWAP_AB with activation_buffer requires single_a_tensormap"
+        )
     # The kernel rejects the other unsupported modes when it is built.
     if block_major_weights and (
         kernel_override is not None
@@ -785,7 +787,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
     single_a_tensormap = (
         single_a_tensormap
         and problem_type == _FPROP
-        and not (swap_ab or host_a_tensormap or cfg["NUM_CTAS"] != 1)
+        and not (host_a_tensormap or cfg["NUM_CTAS"] != 1)
     )
     has_padding_sentinels = has_padding_sentinels or has_padded_activation
     if has_padded_activation and m_multiple_of % token_tile != 0:
@@ -857,7 +859,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
             swiglu_emit_h2=swiglu_emit_h2,
             swiglu_emit_h1=swiglu_emit_h1,
             use_pdl=pdl_enabled(),
-            block_major_b=block_major_weights,
+            block_major_weights=block_major_weights,
             single_a_tensormap=single_a_tensormap,
         )
     else:
@@ -1103,7 +1105,7 @@ def _fused_dist_grouped_gemm_impl(  # noqa: C901
         kernel.swiglu_emit_h1,
         kernel.GATHER_K_SEGMENTS,
         kernel.use_pdl,
-        kernel.block_major_b,
+        kernel.block_major_weights,
         kernel.SINGLE_A_TENSORMAP,
     )
     # Kernel-logical axes depend on problem_type:
@@ -1277,11 +1279,10 @@ def dist_grouped_gemm_fprop_dispatch(
     When `activation_buffer` is provided, `y` and `x_gathered` must be
     int64[1] device tensors holding byte offsets into the buffer (kernel
     patches TMA descriptors at runtime). `single_a_tensormap=True` patches
-    the A descriptor once per CTA instead of once per expert when the launch
-    allows it (non-swapped, unpadded, 1-CTA); otherwise it is ignored. The
-    caller must pre-stage `x` to
-    symm-mem and barrier the EP group before this launch. Addresses must
-    be 128-byte aligned.
+    the activation descriptor (A, or B when swapped) once per CTA instead of
+    once per expert when the launch allows it (unpadded, 1-CTA); otherwise it
+    is ignored. The caller must pre-stage `x` to symm-mem and barrier the EP
+    group before this launch. Addresses must be 128-byte aligned.
 
     In that mode `swiglu_h2` is also an int64[1] device byte offset. Existing
     context storage supplies all three disjoint packed destinations: y has

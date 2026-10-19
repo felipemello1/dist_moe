@@ -854,6 +854,30 @@ def _model_config(
     )
 
 
+def _decode_swap_ab_config(estimated_rows: int, w_ENK: torch.Tensor) -> str | None:
+    """Swapped 32-token-tile config for decode (few rows per expert), else ``None``.
+
+    Weight rows go on the MMA's M side and tokens on a 32-token N tile: a stage
+    holds 4 KB of tokens per 16 KB of weights instead of 8 KB of mostly padded
+    64-row tiles, so more weight bytes are in flight. At EP 4 it wins at 4-8
+    rows per expert; at 16-24 it wins with D 4096-7168 (3-10 us per layer) and
+    loses up to 4 us with D 2048; at 32 it loses 10-41 us.
+
+    Args:
+        estimated_rows: Host estimate of routed rows on this rank (``T * top_k``).
+        w_ENK: Local W13 ``[E, 2F, D]`` or W2 ``[E, D, F]`` weights; swapped
+            only when ``N`` is a multiple of 128.
+
+    Example, 64 local experts, top-8:
+        64 tokens  ->  512 rows <= 24 * 64 -> swapped
+        256 tokens -> 2048 rows >  24 * 64 -> None
+    """
+    num_experts, out_dim, _ = w_ENK.shape
+    if out_dim % 128 == 0 and estimated_rows <= 24 * num_experts:
+        return "1cta1mma_bm128_bn32_bk128_swap_ab"
+    return None
+
+
 def _bf16_compute_config(
     config: Config,
     *,
@@ -2072,6 +2096,9 @@ class _Bf16Autograd(torch.autograd.Function):
             num_groups=w13_EFD.shape[0],
             combine_fprop=True,
         )
+        if fprop_config is None:
+            fprop_config = _decode_swap_ab_config(estimated_num_recv_rows, w13_EFD)
+            combine_config = _decode_swap_ab_config(estimated_num_recv_rows, w2_EDF)
         fused_swiglu_forward = (
             options.swiglu_clip_stats_out_3 is None
             and not config.block_major_weights

@@ -4495,6 +4495,60 @@ class DistMoeKernelTest(unittest.TestCase):
                 block_context.close()
                 torch.testing.assert_close(block_major_TD, row_major_TD, rtol=0, atol=0)
 
+    def test_bf16_inference_swap_ab_matches_default(self) -> None:
+        """Decode-sized swapped GEMMs give the default tiles' exact output.
+
+        The shared case has 4 rows per expert, so dispatch and combine build
+        swapped kernels on the single activation descriptor, with row-major and
+        block-major weights; both outputs must equal the call with the gate off.
+        """
+        import dist_moe.kernels.dist_grouped_gemm as gemm_impl
+
+        context, case_a, _, w13_EFD, w2_EDF = self._create_case()
+        block_context = dist_moe.create_context(
+            group=dist.group.WORLD,
+            config=dataclasses.replace(context.config, block_major_weights=True),
+        )
+        block_w13, block_w2 = w13_EFD.clone(), w2_EDF.clone()
+        dist_moe.relayout_to_block_major(block_w13)
+        dist_moe.relayout_to_block_major(block_w2)
+        get_kernel = gemm_impl._get_dist_kernel
+        kernels = []
+
+        def record_kernel(*args, **kwargs):
+            kernels.append(get_kernel(*args, **kwargs))
+            return kernels[-1]
+
+        with torch.inference_mode():
+            with mock.patch.object(
+                api_impl, "_decode_swap_ab_config", lambda *args: None
+            ):
+                default_TD = dist_moe.routed_experts(*case_a, w13_EFD, w2_EDF, context)
+            with mock.patch.object(gemm_impl, "_get_dist_kernel", record_kernel):
+                swapped_TD = dist_moe.routed_experts(*case_a, w13_EFD, w2_EDF, context)
+                block_TD = dist_moe.routed_experts(
+                    *case_a, block_w13, block_w2, block_context
+                )
+        context.close()
+        block_context.close()
+        torch.testing.assert_close(swapped_TD, default_TD, rtol=0, atol=0)
+        torch.testing.assert_close(block_TD, default_TD, rtol=0, atol=0)
+        self.assertEqual(
+            {
+                (kernel.mode, kernel.block_major_weights)
+                for kernel in kernels
+                if kernel.SWAP_AB and kernel.SINGLE_A_TENSORMAP
+            },
+            {
+                (mode, block_major)
+                for mode in (
+                    gemm_impl.DistGroupedGemmKernel.DISPATCH,
+                    gemm_impl.DistGroupedGemmKernel.COMBINE,
+                )
+                for block_major in (False, True)
+            },
+        )
+
     def test_two_saved_layers_match_reference_without_recompute(self) -> None:
         """Each layer retains its own post-combine state for score gradients."""
         context, case_a, case_b, w13_first, w2_first = self._create_case(
@@ -5070,8 +5124,9 @@ class DistMoeTwoRankTest(unittest.TestCase):
         sends nothing in one case, and NaN tokens sit next to valid ones, so tile
         tails load other experts' rows, including NaN rows. Valid outputs must be
         bitwise equal to the same call with per-group descriptors, and both GEMMs
-        must have used the single descriptor. No other test runs BF16 inference
-        over real peers.
+        must have used the single descriptor. Forced swapped tiles (2 to 180 rows
+        per expert) must match too: the only swapped combine over real peers. No
+        other test runs BF16 inference over real peers.
         """
         import dist_moe.kernels.dist_grouped_gemm as gemm_impl
 
@@ -5121,6 +5176,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
             return get_kernel(*args, **kwargs)
 
         launch = gemm_impl._fused_dist_grouped_gemm_impl
+        swap_config = "1cta1mma_bm128_bn32_bk128_swap_ab"
 
         def per_group_launch(*args, **kwargs):
             return launch(*args, **{**kwargs, "single_a_tensormap": False})
@@ -5143,7 +5199,13 @@ class DistMoeTwoRankTest(unittest.TestCase):
                 ids.fill_(-1)
                 scores.zero_()
             single_flags.clear()
-            with torch.inference_mode():
+            # Per-group descriptors exist for non-swapped tiles only.
+            with (
+                torch.inference_mode(),
+                mock.patch.object(
+                    api_impl, "_decode_swap_ab_config", lambda *args: None
+                ),
+            ):
                 with mock.patch.object(gemm_impl, "_get_dist_kernel", record_kernel):
                     single = dist_moe.routed_experts(x, ids, scores, w13, w2, context)
                 with mock.patch.object(
@@ -5152,10 +5214,20 @@ class DistMoeTwoRankTest(unittest.TestCase):
                     per_group = dist_moe.routed_experts(
                         x, ids, scores, w13, w2, context
                     )
+            # Forced swapped tiles (2 to 180 rows per expert, up to six 32-token
+            # tiles) must give the single descriptor's output too.
+            with (
+                torch.inference_mode(),
+                mock.patch.object(
+                    api_impl, "_decode_swap_ab_config", lambda *args: swap_config
+                ),
+            ):
+                swapped = dist_moe.routed_experts(x, ids, scores, w13, w2, context)
             self.assertTrue(single_flags and all(flag for _, flag in single_flags))
             valid = torch.isfinite(x).all(dim=1)
             self.assertTrue(torch.isfinite(single[valid]).all())
             torch.testing.assert_close(single[valid], per_group[valid], rtol=0, atol=0)
+            torch.testing.assert_close(swapped[valid], single[valid], rtol=0, atol=0)
         context.close()
 
     @with_comms

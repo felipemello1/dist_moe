@@ -495,6 +495,7 @@ class GroupedGemmKernel:
     # rows (possibly still being gathered). Safe: an output row depends only on
     # its own A row and every epilogue clips to m_size (per-group C descriptor,
     # fused SwiGLU stores, combine scatter `row_in_group < m_size`).
+    # Swapped, the activations are B and the weights keep their host-built descriptor.
     SINGLE_A_TENSORMAP: bool = False
 
     def __init__(
@@ -1086,6 +1087,8 @@ class GroupedGemmKernel:
                 BLOCK_SIZE_N=BLOCK_SIZE_N,
                 BLOCK_SIZE_K=BLOCK_SIZE_K,
                 NUM_CTAS=NUM_CTAS,
+                a_coord_layout=mA.layout,
+                b_coord_layout=mB.layout,
             )
         elif warp_idx == MMA_WARP_ID:
             # Retrieve TMEM ptr and build accumulator tensor.
@@ -1368,6 +1371,7 @@ class GroupedGemmKernel:
         NUM_CTAS: cutlass.Constexpr[int],
         secondary_operands=None,
         a_coord_layout=None,
+        b_coord_layout=None,
     ):
         """TMA producer task. Ports the TLX producer body in control flow,
         with intentional 2-CTA cooperative-tile semantics (see deltas below).
@@ -1497,24 +1501,44 @@ class GroupedGemmKernel:
                     total_rows += cutlass.Int32(split_sizes[lane + chunk * 32])
             for shift in cutlass.range_constexpr(5):
                 total_rows += cute.arch.shuffle_sync_bfly(total_rows, offset=1 << shift)
-            tensormap_manager.update_tensormap(
-                (
-                    _make_tensor_for_tensormap_update(
-                        a_base_eff,
-                        self.a_dtype,
-                        (cutlass.max(total_rows, cutlass.Int32(1)), N, K),
-                        a_s0,
-                        a_s1,
-                        tensor_index=0,
-                        problem_type=problem_type,
+            if cutlass.const_expr(self.SWAP_AB):
+                tensormap_manager.update_tensormap(
+                    (
+                        _make_tensor_for_tensormap_update(
+                            b_base_eff,
+                            self.b_dtype,
+                            (M, cutlass.max(total_rows, cutlass.Int32(1)), K),
+                            b_s0,
+                            b_s1,
+                            tensor_index=1,
+                            problem_type=problem_type,
+                        ),
                     ),
-                ),
-                (tma_atom_a,),
-                (tensormap_a_ptr,),
-                TMA_WARP_ID,
-                (tensormap_a_smem_ptr,),
-            )
-            tensormap_manager.fence_tensormap_update(tensormap_a_ptr)
+                    (tma_atom_b,),
+                    (tensormap_b_ptr,),
+                    TMA_WARP_ID,
+                    (tensormap_b_smem_ptr,),
+                )
+                tensormap_manager.fence_tensormap_update(tensormap_b_ptr)
+            else:
+                tensormap_manager.update_tensormap(
+                    (
+                        _make_tensor_for_tensormap_update(
+                            a_base_eff,
+                            self.a_dtype,
+                            (cutlass.max(total_rows, cutlass.Int32(1)), N, K),
+                            a_s0,
+                            a_s1,
+                            tensor_index=0,
+                            problem_type=problem_type,
+                        ),
+                    ),
+                    (tma_atom_a,),
+                    (tensormap_a_ptr,),
+                    TMA_WARP_ID,
+                    (tensormap_a_smem_ptr,),
+                )
+                tensormap_manager.fence_tensormap_update(tensormap_a_ptr)
 
         while work.is_valid_tile:
             g = work.group_idx
@@ -1524,7 +1548,13 @@ class GroupedGemmKernel:
             num_k_tiles = work.num_k_tiles
             prev_accum_cnt_smem = accum_cnt_smem
             group_tAgA = tAgA
-            if cutlass.const_expr(self.SINGLE_A_TENSORMAP):
+            group_tBgB = tBgB
+            if cutlass.const_expr(self.SINGLE_A_TENSORMAP and self.SWAP_AB):
+                # Swapped, the activations are B: shift B's coordinates instead.
+                b_coords = cute.make_tensor(tBgB.iterator, b_coord_layout)
+                group_b_coords = cute.domain_offset((work.split_prefix, 0, 0), b_coords)
+                group_tBgB = cute.make_tensor(group_b_coords.iterator, tBgB.layout)
+            elif cutlass.const_expr(self.SINGLE_A_TENSORMAP):
                 # Shift the A coordinates to this group's first row. domain_offset
                 # needs the (M, K, L) coordinate profile, which the partitioned
                 # tAgA.layout has lost (same idiom as gemm_warp_roles.py).
@@ -1619,7 +1649,9 @@ class GroupedGemmKernel:
                         TMA_WARP_ID,
                         (tensormap_a_smem_ptr,),
                     )
-                elif cutlass.const_expr(not self.host_b_tensormap):
+                elif cutlass.const_expr(
+                    not self.host_b_tensormap and not self.SINGLE_A_TENSORMAP
+                ):
                     b_base_g = b_base_eff + b_off_bytes
                     real_tensor_b = _make_tensor_for_tensormap_update(
                         b_base_g,
@@ -1653,14 +1685,20 @@ class GroupedGemmKernel:
                 # not per tile — the per-tile placement was wasteful.
                 if cutlass.const_expr(patch_a_per_group):
                     tensormap_manager.fence_tensormap_update(tensormap_a_ptr)
-                if cutlass.const_expr(not self.host_b_tensormap):
+                if cutlass.const_expr(
+                    not self.host_b_tensormap and not self.SINGLE_A_TENSORMAP
+                ):
                     tensormap_manager.fence_tensormap_update(tensormap_b_ptr)
 
-                # The weights are the B operand only in a non-swapped forward; it always
-                # loads B via the host tensormap, so the other copies stay as is.
-                b_policy = None
-                if cutlass.const_expr(problem_type == _FPROP and not self.SWAP_AB):
-                    b_policy = _weight_l2_policy(m_size, self.BLOCK_SIZE_M)
+                # Forward weights load through a host descriptor: B, or A when
+                # swapped (tokens on N). Only those copies take the policy.
+                weight_policy = None
+                if cutlass.const_expr(problem_type == _FPROP):
+                    token_rows = n_size if self.SWAP_AB else m_size
+                    token_tile = (
+                        self.BLOCK_SIZE_N if self.SWAP_AB else self.BLOCK_SIZE_M
+                    )
+                    weight_policy = _weight_l2_policy(token_rows, token_tile)
 
                 # Loop while current tile_idx falls within this group.
                 while work.is_valid_tile and work.group_idx == g:
@@ -1733,7 +1771,7 @@ class GroupedGemmKernel:
                                         tBsB[(None, buf)],
                                         tma_bar_ptr=ab_full_mbar + buf,
                                         mcast_mask=b_full_mcast_mask,
-                                        cache_policy=b_policy,
+                                        cache_policy=weight_policy,
                                     )
                                 else:
                                     b_desc_ptr = tensormap_manager.get_tensormap_ptr(
@@ -1742,7 +1780,7 @@ class GroupedGemmKernel:
                                     )
                                     cute.copy(
                                         tma_atom_b,
-                                        tBgB[(None, tile_n_idx, kk, 0)],
+                                        group_tBgB[(None, tile_n_idx, kk, 0)],
                                         tBsB[(None, buf)],
                                         tma_bar_ptr=ab_full_mbar + buf,
                                         mcast_mask=b_full_mcast_mask,
@@ -1782,6 +1820,17 @@ class GroupedGemmKernel:
                                 tAsA[(None, buf)],
                                 tma_bar_ptr=ab_full_mbar + buf,
                                 mcast_mask=a_full_mcast_mask,
+                            )
+                        elif cutlass.const_expr(
+                            self.SINGLE_A_TENSORMAP and self.SWAP_AB
+                        ):
+                            cute.copy(
+                                tma_atom_a,
+                                tAgA[(None, tile_m_idx, kk, g)],
+                                tAsA[(None, buf)],
+                                tma_bar_ptr=ab_full_mbar + buf,
+                                mcast_mask=a_full_mcast_mask,
+                                cache_policy=weight_policy,
                             )
                         else:
                             a_desc_ptr = tensormap_manager.get_tensormap_ptr(
@@ -1835,6 +1884,17 @@ class GroupedGemmKernel:
                                 tma_bar_ptr=ab_full_mbar + buf,
                                 mcast_mask=a_full_mcast_mask,
                             )
+                        elif cutlass.const_expr(
+                            self.SINGLE_A_TENSORMAP and self.SWAP_AB
+                        ):
+                            cute.copy(
+                                tma_atom_a,
+                                tAgA[(None, tile_m_idx, kk, g)],
+                                tAsA[(None, buf)],
+                                tma_bar_ptr=ab_full_mbar + buf,
+                                mcast_mask=a_full_mcast_mask,
+                                cache_policy=weight_policy,
+                            )
                         else:
                             a_desc_ptr = tensormap_manager.get_tensormap_ptr(
                                 tensormap_a_ptr, cute.AddressSpace.generic
@@ -1854,7 +1914,7 @@ class GroupedGemmKernel:
                                 tBsB[(None, buf)],
                                 tma_bar_ptr=ab_full_mbar + buf,
                                 mcast_mask=b_full_mcast_mask,
-                                cache_policy=b_policy,
+                                cache_policy=weight_policy,
                             )
                         else:
                             b_desc_ptr = tensormap_manager.get_tensormap_ptr(
@@ -1862,7 +1922,7 @@ class GroupedGemmKernel:
                             )
                             cute.copy(
                                 tma_atom_b,
-                                tBgB[(None, tile_n_idx, kk, 0)],
+                                group_tBgB[(None, tile_n_idx, kk, 0)],
                                 tBsB[(None, buf)],
                                 tma_bar_ptr=ab_full_mbar + buf,
                                 mcast_mask=b_full_mcast_mask,
@@ -1887,8 +1947,7 @@ class GroupedGemmKernel:
             # 2-CTA: leader is the one who armed the bar via
             # mbarrier_arrive_and_expect_tx, so only leader waits. Peer CTA
             # has no equivalent local arrive on this bar.
-            # Skipped for a single A descriptor: nothing is patched between
-            # groups (B uses the host descriptor).
+            # Skipped when no descriptor is patched per group.
             if cutlass.const_expr(not self.SINGLE_A_TENSORMAP):
                 if accum_cnt_smem > prev_accum_cnt_smem:
                     if (NUM_CTAS == 1) or (cluster_cta_rank == 0):
