@@ -743,7 +743,17 @@ def derive_auto_grouped_gemm_fprop_config(
         512,
         _align_up(m_per_group, _NATIVE_FPROP_BLOCK_M_GRANULARITY),
     )
-    if block_m > _NATIVE_FPROP_MAX_1CTA_BLOCK_M:
+    if block_m <= _NATIVE_FPROP_MAX_1CTA_BLOCK_M:
+        # Size for ~2 standard deviations over the average rows per expert (about
+        # Poisson), so busy experts don't re-read weights in a second M tile:
+        # 49 -> 64 rows, 50 -> 128. Cost: a 128-row tile has fewer smem stages
+        # (bm64_bn128 -> bm128_bn256 goes from 9 to 4).
+        busiest_rows = m_per_group + math.ceil(2 * math.sqrt(m_per_group))
+        block_m = min(
+            _NATIVE_FPROP_MAX_1CTA_BLOCK_M,
+            _align_up(busiest_rows, _NATIVE_FPROP_BLOCK_M_GRANULARITY),
+        )
+    else:
         block_m = (
             _NATIVE_FPROP_MIDDLE_BLOCK_M
             if block_m <= _NATIVE_FPROP_MIDDLE_BLOCK_M

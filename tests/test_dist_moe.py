@@ -640,6 +640,24 @@ class DistMoeConfigTest(unittest.TestCase):
                     block_m,
                 )
 
+    def test_bf16_inference_fprop_tile_fits_the_busiest_expert(self) -> None:
+        """Auto M tile: rows per expert + 2 sqrt, rounded to 64, 1-CTA up to 128."""
+        for rows_per_expert, block_m in (
+            (49, 64),
+            (50, 128),
+            (64, 128),
+            (65, 128),
+            (129, 256),
+        ):
+            with self.subTest(rows_per_expert=rows_per_expert):
+                name = grouped_gemm_config_impl.auto_grouped_gemm_config(
+                    GM=rows_per_expert * 64, G=64, N=1024
+                )
+                self.assertEqual(
+                    grouped_gemm_config_impl.GROUPED_GEMM_CONFIGS[name]["BLOCK_SIZE_M"],
+                    block_m,
+                )
+
     def test_wide_tmem_load_workaround_targets_blackwell(self) -> None:
         """Apply the TMEM-load cap to both Blackwell targets and nothing else."""
         check = grouped_gemm_kernel_impl._tmem_ld_wide_fragment_nvvm_broken
