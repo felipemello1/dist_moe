@@ -71,6 +71,7 @@ from .tile_scheduler import (
     _FPROP,
     _get_bufidx_phase,
     _ring_cached_slot,
+    _skip_finished_groups,
     _WGRAD,
     advance_blockscaled_scale_start,
     blockscaled_scale_row_start,
@@ -1730,7 +1731,33 @@ class MegaBlockScaledGroupedGemmKernel(DistBlockScaledGroupedGemmKernel):
         ring_cached_chunk = cutlass.Int32(-1)
         ring_cached_row_base = cutlass.Int32(0)
         ring_cached_scale_base = cutlass.Int32(0)
-        for g in cutlass.range(G, unroll=1):
+        g = cutlass.Int32(0)
+        while g < cutlass.Int32(G):
+            (
+                g,
+                tile_start,
+                (start_m, scale_start_m, act_tile_start, ring_chunk_prefix),
+            ) = _skip_finished_groups(
+                split_sizes,
+                G,
+                g,
+                tile_start,
+                tile_idx,
+                (start_m, scale_start_m, act_tile_start, ring_chunk_prefix),
+                lambda rows: (
+                    rows // cutlass.Int32(self.sf_vec_size) * copy_col_work_tiles,
+                    (
+                        rows,
+                        advance_blockscaled_scale_start(
+                            cutlass.Int32(0), rows, self.SWAP_AB, self.BLOCK_SIZE_N
+                        ),
+                        ceil_div(rows, cutlass.Int32(ACT_BLOCK_SIZE)),
+                        ceil_div(rows, cutlass.Int32(self.PIPELINE_CHUNK_ROWS))
+                        if cutlass.const_expr(activation_ring)
+                        else cutlass.Int32(0),
+                    ),
+                ),
+            )
             m_size = cutlass.Int32(split_sizes[g])
             group_row_blocks = m_size // cutlass.Int32(self.sf_vec_size)
             group_tiles = group_row_blocks * copy_col_work_tiles
@@ -1876,6 +1903,7 @@ class MegaBlockScaledGroupedGemmKernel(DistBlockScaledGroupedGemmKernel):
                 ring_chunk_prefix += ceil_div(
                     m_size, cutlass.Int32(self.PIPELINE_CHUNK_ROWS)
                 )
+            g += cutlass.Int32(1)
 
     @cute.jit
     def _mega_forward_swiglu_quant_producer_body(
