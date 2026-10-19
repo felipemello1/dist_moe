@@ -3501,6 +3501,7 @@ def _block_scaled_forward_op(
         x_TD=x_TD,
         topk_expert_ids_TK=topk_expert_ids_TK,
         topk_scores_TK=topk_scores_TK,
+        inference_mode=context.config.inference,
     )
     output_TD = _run_async_forward(
         kernel_ctx,
