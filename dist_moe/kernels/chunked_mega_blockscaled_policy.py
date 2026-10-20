@@ -249,6 +249,9 @@ def _stage_all_fc13(
     hidden_dim: int,
     intermediate_dim: int,
     mixed_weight_format: bool = False,
+    format: BlockScaledFormatSpec | None = None,
+    world_size: int | None = None,
+    routed_rows: int | None = None,
 ) -> bool:
     # Avoid parking persistent clusters on FC2 dependencies when FC2 has a
     # large task frontier or FC13 publishes activations from its epilogue.
@@ -264,9 +267,19 @@ def _stage_all_fc13(
     # Interleaved MXFP8-activation prefill up to a few waves gains from
     # staging on local EP4 (contraction 32768 rows/rank -14.5%, A8W4 -10.0%), but the
     # same schedule measured 5-16% slower against the ambient-drift control on
-    # contraction at EP8-EP32 for exactly the staged tiers, so prefill keeps the wave
-    # schedule until a scale-aware policy is measured.
-    return False
+    # contraction at EP8-EP32 for exactly the staged tiers. So only EP <= 4 stages
+    # MXFP8 fused-SwiGLU prefill, up to 4 waves of routed rows (`rows` is the padded
+    # capacity). 65,536 routed rows/rank at EP4: Qwen3.5-35B-A3B 758.8 -> 666.5 us,
+    # DeepSeek-V3 3169 -> 2794 us.
+    return (
+        format is MXFP8_E4M3
+        and interleaved_fc13
+        and not mixed_weight_format
+        and world_size is not None
+        and world_size <= 4
+        and routed_rows is not None
+        and routed_rows < 4 * num_sms * DEFAULT_BLOCKSCALED_GROUPED_GEMM_M_MULTIPLE_OF
+    )
 
 
 def _mega_fp4_mma_atom_n(

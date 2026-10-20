@@ -1740,6 +1740,9 @@ def chunked_mega_blockscaled_grouped_gemm_fprop_swiglu_fwd(  # noqa: C901
                 hidden_dim=hidden_dim,
                 intermediate_dim=intermediate_dim,
                 mixed_weight_format=mixed_operand_widths,
+                format=format,
+                world_size=symm_mem_buffer.hdl.world_size,
+                routed_rows=estimate_recv_num_tokens,
             ),
         )
     )
