@@ -139,21 +139,21 @@ def copy_routing(
     num_experts: int,
     validate_expert_ids: bool,
 ) -> None:
-    """Publish inference routing metadata with native stream semantics."""
-    _validate_routing_publication(
+    """Publish inference routing metadata (token count and IDs) in one launch.
+
+    The routing-and-dispatch publisher with no rows: one kernel instead of a copy
+    and a fill. Same bytes.
+    """
+    no_rows = routing.new_empty((0, 0), dtype=torch.bfloat16)
+    copy_routing_and_dispatch(
+        x=no_rows,
+        dispatch=no_rows,
         expert_ids=expert_ids,
         routing=routing,
         routing_token_count_1=routing_token_count_1,
-        device=expert_ids.device,
+        num_experts=num_experts,
+        validate_expert_ids=validate_expert_ids,
     )
-    if validate_expert_ids:
-        valid = (expert_ids >= -1) & (expert_ids < num_experts)
-        torch._assert_async(
-            torch.all(valid),
-            "DistMoE expert ID is outside [-1, num_experts)",
-        )
-    routing.copy_(expert_ids)
-    routing_token_count_1.fill_(expert_ids.shape[0])
 
 
 def copy_routing_and_dispatch(

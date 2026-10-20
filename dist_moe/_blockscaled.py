@@ -3536,22 +3536,27 @@ def _block_scaled_forward_op(
         topk_scores_TK=topk_scores_TK,
         inference_mode=context.config.inference,
     )
-    output_TD = _run_async_forward(
-        kernel_ctx,
-        x_TD,
-        topk_expert_ids_TK,
-        topk_scores_TK,
-        w13_EFD,
-        w2_EDF,
-        prepared,
-        context,
-        postprocess,
-        activation_slot_id_1,
-        num_moe_layers_in_slot,
-        save_for_backward,
-        validate_expert_ids,
-        interleaved_fc13,
-    )
+    # Registered-op inference launches its kernel chain with PDL (kernels/pdl.py),
+    # as the BF16 op does; the PDL-capable Triton kernels overlap their launch.
+    from .kernels.pdl import pdl_launches
+
+    with pdl_launches(context.config.inference):
+        output_TD = _run_async_forward(
+            kernel_ctx,
+            x_TD,
+            topk_expert_ids_TK,
+            topk_scores_TK,
+            w13_EFD,
+            w2_EDF,
+            prepared,
+            context,
+            postprocess,
+            activation_slot_id_1,
+            num_moe_layers_in_slot,
+            save_for_backward,
+            validate_expert_ids,
+            interleaved_fc13,
+        )
     if not save_for_backward:
         return output_TD, _block_scaled_forward_metadata(
             x_TD,
